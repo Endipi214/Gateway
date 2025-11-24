@@ -156,10 +156,6 @@ void *ws_thread_fn(void *arg) {
   return NULL;
 }
 
-/* ============================================================================
- * BACKEND THREAD
- * ========================================================================== */
-
 void *backend_thread_fn(void *arg) {
   int epoll_fd = epoll_create1(0);
   if (epoll_fd < 0) {
@@ -284,10 +280,6 @@ void *backend_thread_fn(void *arg) {
   printf("[Backend Thread] Stopped\n");
   return NULL;
 }
-
-/* ============================================================================
- * MONITORING THREAD
- * ========================================================================== */
 
 void *monitor_thread_fn(void *arg) {
   printf("\n[Monitor] Started - reporting every 5 seconds\n\n");

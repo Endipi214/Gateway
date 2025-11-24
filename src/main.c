@@ -24,6 +24,8 @@ atomic_bool running;
 client_conn_t clients[MAX_CLIENTS];
 backend_conn_t backends[BACKEND_POOL_SIZE];
 
+atomic_bool running = ATOMIC_VAR_INIT(1);
+
 metrics_t metrics_ws;
 metrics_t metrics_backend;
 

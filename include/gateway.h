@@ -12,7 +12,7 @@
 #define MAX_BACKENDS 16
 #define EPOLL_EVENTS 64
 #define LISTEN_BACKLOG 128
-#define BACKEND_POOL_SIZE 4
+#define BACKEND_POOL_SIZE 10
 #define RECONNECT_INTERVAL 5
 
 // --------- Declare globals ---------
