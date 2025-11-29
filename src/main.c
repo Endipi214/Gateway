@@ -22,7 +22,6 @@ int eventfd_backend;
 atomic_bool running;
 
 client_conn_t clients[MAX_CLIENTS];
-backend_conn_t backends[BACKEND_POOL_SIZE];
 
 atomic_bool running = ATOMIC_VAR_INIT(1);
 
@@ -30,8 +29,9 @@ metrics_t metrics_ws;
 metrics_t metrics_backend;
 
 int ws_port;
-int backend_port;
-char backend_host[256];
+backend_server_t backend_servers[MAX_BACKEND_SERVERS];
+int backend_server_count = 0;
+backend_conn_t backends[MAX_BACKEND_SERVERS];
 
 // Signal handling
 void signal_handler(int sig) {
@@ -42,17 +42,42 @@ void signal_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    fprintf(stderr, "Usage: %s <ws_port> <backend_host> <backend_port>\n",
-            argv[0]);
-    fprintf(stderr, "Example: %s 8080 127.0.0.1 9090\n", argv[0]);
+  if (argc < 3) {
+    fprintf(
+        stderr,
+        "Usage: %s <ws_port> <backend1_host:port> [backend2_host:port] ...\n",
+        argv[0]);
+    fprintf(
+        stderr,
+        "Example: %s 8080 127.0.0.1:9090 127.0.0.1:9091 192.168.1.10:9090\n",
+        argv[0]);
     return 1;
   }
 
   ws_port = atoi(argv[1]);
-  strncpy(backend_host, argv[2], sizeof(backend_host) - 1);
-  backend_port = atoi(argv[3]);
 
+  // Parse all backend servers
+  for (int i = 2; i < argc && backend_server_count < MAX_BACKEND_SERVERS; i++) {
+    char *colon = strchr(argv[i], ':');
+    if (!colon) {
+      fprintf(stderr, "Invalid backend format: %s (expected host:port)\n",
+              argv[i]);
+      continue;
+    }
+
+    int host_len = colon - argv[i];
+    strncpy(backend_servers[backend_server_count].host, argv[i], host_len);
+    backend_servers[backend_server_count].host[host_len] = '\0';
+    backend_servers[backend_server_count].port = atoi(colon + 1);
+    backend_server_count++;
+  }
+
+  if (backend_server_count == 0) {
+    fprintf(stderr, "Error: No valid backend servers specified\n");
+    return 1;
+  }
+
+  // NEW banner
   printf(
       "╔════════════════════════════════════════════════════════════════╗\n");
   printf("║       High-Performance WebSocket Gateway (Production)         ║\n");
@@ -60,14 +85,16 @@ int main(int argc, char **argv) {
       "╠════════════════════════════════════════════════════════════════╣\n");
   printf("║  WebSocket Port:    %5d                                      ║\n",
          ws_port);
-  printf("║  Backend:           %s:%-5d                              ║\n",
-         backend_host, backend_port);
+  printf("║  Backend Servers:   %d configured                             ║\n",
+         backend_server_count);
+  for (int i = 0; i < backend_server_count; i++) {
+    printf("║    [%d] %s:%-5d                                           ║\n", i,
+           backend_servers[i].host, backend_servers[i].port);
+  }
   printf("║  Memory Pool:       %d messages                              ║\n",
          POOL_SIZE);
   printf("║  Queue Size:        %d slots each                            ║\n",
          QUEUE_SIZE);
-  printf("║  Backend Pool:      %d connections                           ║\n",
-         BACKEND_POOL_SIZE);
   printf(
       "╚════════════════════════════════════════════════════════════════╝\n\n");
 
@@ -85,7 +112,13 @@ int main(int argc, char **argv) {
   for (int i = 0; i < MAX_CLIENTS; i++) {
     clients[i].fd = -1;
   }
-
+  // NEW: Initialize backend array
+  for (int i = 0; i < MAX_BACKEND_SERVERS; i++) {
+    backends[i].fd = -1;
+    atomic_store(&backends[i].connected, 0);
+    backends[i].last_attempt = 0;
+    backends[i].reconnect_count = 0;
+  }
   // Create eventfds
   eventfd_ws = eventfd(0, EFD_NONBLOCK);
   eventfd_backend = eventfd(0, EFD_NONBLOCK);

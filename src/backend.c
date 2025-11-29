@@ -71,18 +71,8 @@ int write_backend_frame(int fd, message_t *msg) {
   iov[1].iov_base = msg->data;
   iov[1].iov_len = msg->len;
 
-  ssize_t sent = write(fd, iov, 2);
+  ssize_t sent = writev(fd, iov, 2);
   return (sent == (ssize_t)(sizeof(len) + msg->len)) ? 0 : -1;
-}
-
-// Connection management
-int get_available_backend(void) {
-  for (int i = 0; i < BACKEND_POOL_SIZE; i++) {
-    if (atomic_load_explicit(&backends[i].connected, memory_order_acquire)) {
-      return backends[i].fd;
-    }
-  }
-  return -1;
 }
 
 int connect_to_backend(const char *host, int port) {

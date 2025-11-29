@@ -13,6 +13,7 @@
 #define EPOLL_EVENTS 64
 #define LISTEN_BACKLOG 128
 #define BACKEND_POOL_SIZE 10
+#define MAX_BACKEND_SERVERS 16
 #define RECONNECT_INTERVAL 5
 
 // --------- Declare globals ---------
@@ -38,13 +39,18 @@ typedef struct {
   uint32_t reconnect_count;
 } backend_conn_t;
 
+typedef struct {
+  char host[256];
+  int port;
+} backend_server_t;
+
 // --------- Global Arrays ---------
 extern client_conn_t clients[MAX_CLIENTS];
-extern backend_conn_t backends[BACKEND_POOL_SIZE];
+extern backend_conn_t backends[MAX_BACKEND_SERVERS];
 
 // --------- Configuration ---------
 extern int ws_port;
-extern int backend_port;
-extern char backend_host[256];
+extern int backend_server_count;
+extern backend_server_t backend_servers[MAX_BACKEND_SERVERS];
 
 #endif // __GATEWAY_H__

@@ -200,6 +200,6 @@ int send_ws_frame(int fd, message_t *msg) {
   iov[1].iov_base = msg->data;
   iov[1].iov_len = msg->len;
 
-  ssize_t sent = write(fd, iov, 2);
+  ssize_t sent = writev(fd, iov, 2);
   return (sent == (ssize_t)(header_len + msg->len)) ? 0 : -1;
 }

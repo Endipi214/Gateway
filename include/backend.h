@@ -20,7 +20,6 @@ message_t *read_backend_frame(int fd);
 int write_backend_frame(int fd, message_t *msg);
 
 // Connection management
-int get_available_backend(void);
 int connect_to_backend(const char *host, int port);
 
 #endif // __BACKEND_H__

@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -37,7 +38,7 @@ void *ws_thread_fn(void *arg) {
   ev.data.fd = eventfd_ws;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventfd_ws, &ev);
 
-  printf("[WS Thread] Started on port %d\n", ws_port);
+  printf("[WS Thread] Started on port %d (BROADCAST MODE)\n", ws_port);
 
   struct epoll_event events[EPOLL_EVENTS];
 
@@ -140,14 +141,40 @@ void *ws_thread_fn(void *arg) {
       atomic_fetch_add_explicit(&metrics_ws.bytes_recv, msg->len,
                                 memory_order_relaxed);
 
-      // Route to available backend
-      msg->backend_fd = get_available_backend();
+      // Broadcast To All Backends
+      int broadcast_count = 0;
 
-      if (msg->backend_fd < 0 || !queue_push(&q_ws_to_backend, msg)) {
-        msg_free(msg);
-      } else {
+      for (int i = 0; i < backend_server_count; i++) {
+        if (atomic_load_explicit(&backends[i].connected,
+                                 memory_order_acquire)) {
+          // Create a separate message copy for each backend
+          message_t *broadcast_msg = msg_alloc();
+          if (broadcast_msg) {
+            // Copy the original message data
+            broadcast_msg->client_fd = msg->client_fd;
+            broadcast_msg->backend_fd = backends[i].fd;
+            broadcast_msg->len = msg->len;
+            broadcast_msg->timestamp_ns = msg->timestamp_ns;
+            memcpy(broadcast_msg->data, msg->data, msg->len);
+
+            // Send to this backend
+            if (queue_push(&q_ws_to_backend, broadcast_msg)) {
+              broadcast_count++;
+            } else {
+              msg_free(broadcast_msg);
+            }
+          }
+        }
+      }
+
+      // Signal backend thread if we queued any messages
+      if (broadcast_count > 0) {
         signal_eventfd(eventfd_backend);
       }
+
+      // Free the original message
+      msg_free(msg);
+      // ===============================================
     }
   }
 
@@ -169,28 +196,23 @@ void *backend_thread_fn(void *arg) {
   ev.data.fd = eventfd_backend;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventfd_backend, &ev);
 
-  // Initialize backend connections
-  for (int i = 0; i < BACKEND_POOL_SIZE; i++) {
-    backends[i].fd = -1;
-    atomic_store_explicit(&backends[i].connected, 0, memory_order_release);
-    backends[i].last_attempt = 0;
-    backends[i].reconnect_count = 0;
-  }
-
-  printf("[Backend Thread] Started, connecting to %s:%d\n", backend_host,
-         backend_port);
+  printf("[Backend Thread] Started, connecting to %d backend servers\n",
+         backend_server_count);
 
   struct epoll_event events[EPOLL_EVENTS];
   time_t last_reconnect = 0;
 
   while (atomic_load_explicit(&running, memory_order_acquire)) {
-    // Attempt reconnections
+    // Attempt to connect each slot to its corresponding backend server
     time_t now = time(NULL);
     if (now - last_reconnect >= RECONNECT_INTERVAL) {
-      for (int i = 0; i < BACKEND_POOL_SIZE; i++) {
+      for (int i = 0; i < backend_server_count; i++) {
         if (!atomic_load_explicit(&backends[i].connected,
                                   memory_order_acquire)) {
-          int fd = connect_to_backend(backend_host, backend_port);
+          // Connect slot i to backend server i
+          int fd = connect_to_backend(backend_servers[i].host,
+                                      backend_servers[i].port);
+
           if (fd >= 0) {
             backends[i].fd = fd;
             atomic_store_explicit(&backends[i].connected, 1,
@@ -204,7 +226,10 @@ void *backend_thread_fn(void *arg) {
             atomic_fetch_add_explicit(&metrics_backend.connections, 1,
                                       memory_order_relaxed);
             printf("[Backend] Connected to %s:%d (fd=%d, slot=%d)\n",
-                   backend_host, backend_port, fd, i);
+                   backend_servers[i].host, backend_servers[i].port, fd, i);
+          } else {
+            printf("[Backend] Failed to connect to %s:%d (slot=%d)\n",
+                   backend_servers[i].host, backend_servers[i].port, i);
           }
         }
       }
@@ -236,9 +261,9 @@ void *backend_thread_fn(void *arg) {
       // Read backend frame
       message_t *msg = read_backend_frame(fd);
       if (!msg) {
-        // Check for disconnection
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-          for (int j = 0; j < BACKEND_POOL_SIZE; j++) {
+          // Find which backend slot disconnected
+          for (int j = 0; j < backend_server_count; j++) {
             if (backends[j].fd == fd) {
               epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
               close(fd);
@@ -248,7 +273,7 @@ void *backend_thread_fn(void *arg) {
               atomic_fetch_add_explicit(&metrics_backend.disconnections, 1,
                                         memory_order_relaxed);
               printf("[Backend] Disconnected from %s:%d (fd=%d, slot=%d)\n",
-                     backend_host, backend_port, fd, j);
+                     backend_servers[j].host, backend_servers[j].port, fd, j);
               break;
             }
           }
@@ -270,7 +295,7 @@ void *backend_thread_fn(void *arg) {
   }
 
   // Cleanup backend connections
-  for (int i = 0; i < BACKEND_POOL_SIZE; i++) {
+  for (int i = 0; i < backend_server_count; i++) {
     if (backends[i].fd >= 0) {
       close(backends[i].fd);
     }
@@ -327,6 +352,59 @@ void *monitor_thread_fn(void *arg) {
              avg_lat, avg_lat / 1000.0);
     }
 
+    // Broadcast Statistics
+    printf(
+        "╟────────────────────────────────────────────────────────────────╢\n");
+    printf(
+        "║ Broadcast Statistics:                                          ║\n");
+
+    // Count active backends
+    int active_backends = 0;
+    for (int i = 0; i < backend_server_count; i++) {
+      if (atomic_load(&backends[i].connected))
+        active_backends++;
+    }
+
+    // Calculate broadcast multiplier (how many copies per message)
+    float broadcast_ratio =
+        (ws_recv > 0) ? (float)atomic_load(&metrics_backend.messages_sent) /
+                            (float)ws_recv
+                      : 0.0f;
+
+    printf(
+        "║   Active Backends:    %2d / %-2d                               ║\n",
+        active_backends, backend_server_count);
+    printf("║   Broadcast Ratio:    1 msg → %.1f backends avg              ║\n",
+           broadcast_ratio);
+    printf("║   Total Broadcasted:  %10lu messages                    ║\n",
+           atomic_load(&metrics_backend.messages_sent));
+
+    // Show individual backend status
+    if (backend_server_count > 0) {
+      printf("╟────────────────────────────────────────────────────────────────"
+             "╢\n");
+      printf("║ Backend Connections:                                           "
+             "║\n");
+
+      for (int i = 0; i < backend_server_count && i < 8;
+           i++) { // Limit to 8 for display
+        int connected = atomic_load(&backends[i].connected);
+        uint32_t reconnects = backends[i].reconnect_count;
+
+        // Format: [slot] host:port status reconnects
+        char status_icon = connected ? '+' : 'x';
+        printf("║   [%d] %-15s:%-5d  [%c]  reconnects: %3u        ║\n", i,
+               backend_servers[i].host, backend_servers[i].port, status_icon,
+               reconnects);
+      }
+
+      if (backend_server_count > 8) {
+        printf("║   ... and %d more backends                                   "
+               " ║\n",
+               backend_server_count - 8);
+      }
+    }
+
     // Backend Thread
     printf(
         "╟────────────────────────────────────────────────────────────────╢\n");
@@ -345,16 +423,6 @@ void *monitor_thread_fn(void *arg) {
            be_bytes_r);
     printf("║   Connections:  %6u total  |  %6u disconnections     ║\n",
            be_conn, be_disc);
-
-    // Backend pool status
-    int active_backends = 0;
-    for (int i = 0; i < BACKEND_POOL_SIZE; i++) {
-      if (atomic_load(&backends[i].connected))
-        active_backends++;
-    }
-    printf(
-        "║   Active backends: %d / %d                                     ║\n",
-        active_backends, BACKEND_POOL_SIZE);
 
     // Queue Statistics
     printf(
