@@ -26,7 +26,10 @@ message_t *read_backend_frame(int fd) {
   st->pos += n;
 
   if (st->expected == 0 && st->pos >= 4) {
-    memcpy(&st->expected, st->buffer, 4);
+    uint32_t network_len;
+    memcpy(&network_len, st->buffer, 4);
+    st->expected = ntohl(network_len);
+
     if (st->expected > MAX_MESSAGE_SIZE) {
       st->pos = 0;
       st->expected = 0;
@@ -35,7 +38,7 @@ message_t *read_backend_frame(int fd) {
   }
 
   if (st->expected > 0 && st->pos >= st->expected + 4) {
-    message_t *msg = msg_alloc();
+    message_t *msg = msg_alloc(st->expected);
     if (!msg) {
       st->pos = 0;
       st->expected = 0;
@@ -63,7 +66,7 @@ message_t *read_backend_frame(int fd) {
 }
 
 int write_backend_frame(int fd, message_t *msg) {
-  uint32_t len = msg->len;
+  uint32_t len = htonl(msg->len);
 
   struct iovec iov[2];
   iov[0].iov_base = &len;

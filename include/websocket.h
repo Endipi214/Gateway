@@ -2,7 +2,7 @@
 #define __WEBSOCKET_H__
 
 #include "gateway.h"
-#include "message.h"
+#include "mempool.h"
 
 // ---------- WebSocket state ----------
 typedef struct {

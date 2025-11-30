@@ -142,7 +142,7 @@ message_t *parse_ws_frame(int fd) {
   if (st->pos < frame_size)
     return NULL;
 
-  message_t *msg = msg_alloc();
+  message_t *msg = msg_alloc(payload_len);
   if (!msg) {
     st->pos = 0;
     return NULL;

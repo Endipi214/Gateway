@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
   close(listen_fd);
   close(eventfd_ws);
   close(eventfd_backend);
-  free(g_pool.pool);
+  pool_cleanup();
 
   printf("\n[Main] Gateway stopped cleanly.\n");
   return 0;

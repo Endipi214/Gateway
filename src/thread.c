@@ -10,7 +10,6 @@
 #include "backend.h"
 #include "gateway.h"
 #include "mempool.h"
-#include "message.h"
 #include "metrics.h"
 #include "queue.h"
 #include "thread.h"
@@ -148,7 +147,7 @@ void *ws_thread_fn(void *arg) {
         if (atomic_load_explicit(&backends[i].connected,
                                  memory_order_acquire)) {
           // Create a separate message copy for each backend
-          message_t *broadcast_msg = msg_alloc();
+          message_t *broadcast_msg = msg_alloc(msg->len);
           if (broadcast_msg) {
             // Copy the original message data
             broadcast_msg->client_fd = msg->client_fd;
@@ -319,11 +318,73 @@ void *monitor_thread_fn(void *arg) {
     printf(
         "╠════════════════════════════════════════════════════════════════╣\n");
 
-    // Memory Pool
-    uint32_t free_count = atomic_load(&g_pool.free_count);
-    uint32_t alloc_fail = atomic_load(&g_pool.alloc_failures);
-    printf("║ Memory Pool:  %4u / %4u free  |  %6u alloc failures     ║\n",
-           free_count, POOL_SIZE, alloc_fail);
+    printf(
+        "║ Tiered Memory Pool:                                            ║\n");
+
+    // Global pool statistics
+    uint64_t total_allocs = atomic_load(&g_tiered_pool.total_allocs);
+    uint64_t total_frees = atomic_load(&g_tiered_pool.total_frees);
+    uint64_t in_use = total_allocs - total_frees;
+
+    printf("║   Total Allocations:  %10lu                               ║\n",
+           total_allocs);
+    printf("║   Total Frees:        %10lu                               ║\n",
+           total_frees);
+    printf("║   Messages In-Use:    %10lu                               ║\n",
+           in_use);
+
+    printf(
+        "╟────────────────────────────────────────────────────────────────╢\n");
+    printf(
+        "║ Per-Tier Statistics:                                           ║\n");
+    printf(
+        "║   Tier | Size    | Free/Total | Usage %% | Allocs    | Fails  ║\n");
+    printf(
+        "║   ─────┼─────────┼────────────┼─────────┼───────────┼────────║\n");
+
+    const char *tier_names[] = {"512B  ", "4KB   ", "32KB  ",
+                                "256KB ", "1MB   ", "8MB   "};
+
+    uint32_t total_slots_free = 0;
+    uint32_t total_slots = 0;
+
+    for (int i = 0; i < TIER_COUNT; i++) {
+      uint32_t free, total, failures;
+      uint64_t allocs;
+      pool_get_tier_stats(i, &free, &total, &allocs, &failures);
+
+      total_slots_free += free;
+      total_slots += total;
+
+      uint32_t used = total - free;
+      float usage_pct = (total > 0) ? (100.0f * used / total) : 0.0f;
+
+      printf("║   %d    | %s | %4u/%4u  | %5.1f%%  | %9lu | %6u ║\n", i,
+             tier_names[i], free, total, usage_pct, allocs, failures);
+    }
+
+    printf(
+        "║   ─────┴─────────┴────────────┴─────────┴───────────┴────────║\n");
+
+    // Overall pool utilization
+    uint32_t total_used = total_slots - total_slots_free;
+    float overall_usage =
+        (total_slots > 0) ? (100.0f * total_used / total_slots) : 0.0f;
+    printf("║   TOTAL: %4u/%4u slots used (%.1f%% utilization)            ║\n",
+           total_used, total_slots, overall_usage);
+
+    // Memory usage estimation
+    uint64_t tier_sizes[] = {512, 4096, 32768, 262144, 1048576, 8388608};
+    uint64_t memory_in_use = 0;
+    for (int i = 0; i < TIER_COUNT; i++) {
+      uint32_t free, total, failures;
+      uint64_t allocs;
+      pool_get_tier_stats(i, &free, &total, &allocs, &failures);
+      memory_in_use += (total - free) * (tier_sizes[i] + sizeof(message_t));
+    }
+    printf(
+        "║   Estimated Memory In-Use: %.2f MB                            ║\n",
+        memory_in_use / (1024.0 * 1024.0));
 
     // WebSocket Thread
     printf(

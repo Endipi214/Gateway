@@ -2,7 +2,7 @@
 #define __BACKEND_H__
 
 #include "gateway.h"
-#include "message.h"
+#include "mempool.h"
 #include <stdint.h>
 
 // ---------- Backend struct ---------

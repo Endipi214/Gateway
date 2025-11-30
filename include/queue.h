@@ -2,7 +2,7 @@
 #define __QUEUE_H__
 
 #include "gateway.h"
-#include "message.h"
+#include "mempool.h"
 
 // --------- Single-Producer Single-Consumer Queue ---------
 // This is a lock-free SPSC queue for passing messages between
