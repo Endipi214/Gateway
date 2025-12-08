@@ -311,40 +311,16 @@ void *monitor_thread_fn(void *arg) {
   while (atomic_load_explicit(&running, memory_order_acquire)) {
     sleep(5);
 
-    printf("\n╔════════════════════════════════════════════════════════════════"
-           "╗\n");
-    printf(
-        "║                     GATEWAY METRICS                            ║\n");
-    printf(
-        "╠════════════════════════════════════════════════════════════════╣\n");
-
-    printf(
-        "║ Tiered Memory Pool:                                            ║\n");
+    printf("Tiered Memory Pool:\n");
 
     // Global pool statistics
     uint64_t total_allocs = atomic_load(&g_tiered_pool.total_allocs);
     uint64_t total_frees = atomic_load(&g_tiered_pool.total_frees);
     uint64_t in_use = total_allocs - total_frees;
 
-    printf("║   Total Allocations:  %10lu                               ║\n",
-           total_allocs);
-    printf("║   Total Frees:        %10lu                               ║\n",
-           total_frees);
-    printf("║   Messages In-Use:    %10lu                               ║\n",
-           in_use);
-
-    printf(
-        "╟────────────────────────────────────────────────────────────────╢\n");
-    printf(
-        "║ Per-Tier Statistics:                                           ║\n");
-    printf(
-        "║   Tier | Size    | Free/Total | Usage %% | Allocs    | Fails  ║\n");
-    printf(
-        "║   ─────┼─────────┼────────────┼─────────┼───────────┼────────║\n");
-
-    const char *tier_names[] = {"512B  ", "4KB   ", "32KB  ",
-                                "256KB ", "1MB   ", "8MB   "};
-
+    printf("   Total Allocations:  %10lu\n", total_allocs);
+    printf("   Total Frees:        %10lu\n", total_frees);
+    printf("   Messages In-Use:    %10lu\n", in_use);
     uint32_t total_slots_free = 0;
     uint32_t total_slots = 0;
 
@@ -352,26 +328,15 @@ void *monitor_thread_fn(void *arg) {
       uint32_t free, total, failures;
       uint64_t allocs;
       pool_get_tier_stats(i, &free, &total, &allocs, &failures);
-
       total_slots_free += free;
       total_slots += total;
-
-      uint32_t used = total - free;
-      float usage_pct = (total > 0) ? (100.0f * used / total) : 0.0f;
-
-      printf("║   %d    | %s | %4u/%4u  | %5.1f%%  | %9lu | %6u ║\n", i,
-             tier_names[i], free, total, usage_pct, allocs, failures);
     }
-
-    printf(
-        "║   ─────┴─────────┴────────────┴─────────┴───────────┴────────║\n");
-
     // Overall pool utilization
     uint32_t total_used = total_slots - total_slots_free;
     float overall_usage =
         (total_slots > 0) ? (100.0f * total_used / total_slots) : 0.0f;
-    printf("║   TOTAL: %4u/%4u slots used (%.1f%% utilization)            ║\n",
-           total_used, total_slots, overall_usage);
+    printf("   TOTAL: %4u/%4u slots used (%.1f%% utilization)\n", total_used,
+           total_slots, overall_usage);
 
     // Memory usage estimation
     uint64_t tier_sizes[] = {512, 4096, 32768, 262144, 1048576, 8388608};
@@ -382,15 +347,11 @@ void *monitor_thread_fn(void *arg) {
       pool_get_tier_stats(i, &free, &total, &allocs, &failures);
       memory_in_use += (total - free) * (tier_sizes[i] + sizeof(message_t));
     }
-    printf(
-        "║   Estimated Memory In-Use: %.2f MB                            ║\n",
-        memory_in_use / (1024.0 * 1024.0));
+    printf("   Estimated Memory In-Use: %.2f MB\n",
+           memory_in_use / (1024.0 * 1024.0));
 
     // WebSocket Thread
-    printf(
-        "╟────────────────────────────────────────────────────────────────╢\n");
-    printf(
-        "║ WebSocket Thread:                                              ║\n");
+    printf("WebSocket Thread:\n");
     uint64_t ws_sent = atomic_load(&metrics_ws.messages_sent);
     uint64_t ws_recv = atomic_load(&metrics_ws.messages_recv);
     uint64_t ws_bytes_s = atomic_load(&metrics_ws.bytes_sent);
@@ -398,26 +359,21 @@ void *monitor_thread_fn(void *arg) {
     uint32_t ws_conn = atomic_load(&metrics_ws.connections);
     uint32_t ws_disc = atomic_load(&metrics_ws.disconnections);
 
-    printf("║   Sent:       %10lu msgs  |  %10lu bytes           ║\n", ws_sent,
-           ws_bytes_s);
-    printf("║   Received:   %10lu msgs  |  %10lu bytes           ║\n", ws_recv,
-           ws_bytes_r);
-    printf("║   Connections:  %6u total  |  %6u disconnections     ║\n",
-           ws_conn, ws_disc);
+    printf("   Sent:       %10lu msgs  |  %10lu bytes\n", ws_sent, ws_bytes_s);
+    printf("   Received:   %10lu msgs  |  %10lu bytes\n", ws_recv, ws_bytes_r);
+    printf("   Connections:  %6u total  |  %6u disconnections\n", ws_conn,
+           ws_disc);
 
     uint32_t lat_count = atomic_load(&metrics_ws.latency_count);
     if (lat_count > 0) {
       uint64_t lat_sum = atomic_load(&metrics_ws.latency_sum_ns);
       uint64_t avg_lat = lat_sum / lat_count;
-      printf("║   Avg Latency: %8lu ns  |  %6.2f µs                    ║\n",
-             avg_lat, avg_lat / 1000.0);
+      printf("   Avg Latency: %8lu ns  |  %6.2f µs\n", avg_lat,
+             avg_lat / 1000.0);
     }
 
     // Broadcast Statistics
-    printf(
-        "╟────────────────────────────────────────────────────────────────╢\n");
-    printf(
-        "║ Broadcast Statistics:                                          ║\n");
+    printf("Broadcast Statistics:\n");
 
     // Count active backends
     int active_backends = 0;
@@ -432,21 +388,16 @@ void *monitor_thread_fn(void *arg) {
                             (float)ws_recv
                       : 0.0f;
 
-    printf(
-        "║   Active Backends:    %2d / %-2d                               ║\n",
-        active_backends, backend_server_count);
-    printf("║   Broadcast Ratio:    1 msg → %.1f backends avg              ║\n",
+    printf("   Active Backends:    %2d / %-2d\n", active_backends,
+           backend_server_count);
+    printf("   Broadcast Ratio:    1 msg → %.1f backends avg\n",
            broadcast_ratio);
-    printf("║   Total Broadcasted:  %10lu messages                    ║\n",
+    printf("   Total Broadcasted:  %10lu messages\n",
            atomic_load(&metrics_backend.messages_sent));
 
     // Show individual backend status
     if (backend_server_count > 0) {
-      printf("╟────────────────────────────────────────────────────────────────"
-             "╢\n");
-      printf("║ Backend Connections:                                           "
-             "║\n");
-
+      printf("Backend Connections:\n");
       for (int i = 0; i < backend_server_count && i < 8;
            i++) { // Limit to 8 for display
         int connected = atomic_load(&backends[i].connected);
@@ -454,23 +405,18 @@ void *monitor_thread_fn(void *arg) {
 
         // Format: [slot] host:port status reconnects
         char status_icon = connected ? '+' : 'x';
-        printf("║   [%d] %-15s:%-5d  [%c]  reconnects: %3u        ║\n", i,
+        printf("   [%d] %-15s:%-5d  [%c]  reconnects: %3u\n", i,
                backend_servers[i].host, backend_servers[i].port, status_icon,
                reconnects);
       }
 
       if (backend_server_count > 8) {
-        printf("║   ... and %d more backends                                   "
-               " ║\n",
-               backend_server_count - 8);
+        printf("   ... and %d more backends\n", backend_server_count - 8);
       }
     }
 
     // Backend Thread
-    printf(
-        "╟────────────────────────────────────────────────────────────────╢\n");
-    printf(
-        "║ Backend Thread:                                                ║\n");
+    printf("Backend Thread:\n");
     uint64_t be_sent = atomic_load(&metrics_backend.messages_sent);
     uint64_t be_recv = atomic_load(&metrics_backend.messages_recv);
     uint64_t be_bytes_s = atomic_load(&metrics_backend.bytes_sent);
@@ -478,32 +424,24 @@ void *monitor_thread_fn(void *arg) {
     uint32_t be_conn = atomic_load(&metrics_backend.connections);
     uint32_t be_disc = atomic_load(&metrics_backend.disconnections);
 
-    printf("║   Sent:       %10lu msgs  |  %10lu bytes           ║\n", be_sent,
-           be_bytes_s);
-    printf("║   Received:   %10lu msgs  |  %10lu bytes           ║\n", be_recv,
-           be_bytes_r);
-    printf("║   Connections:  %6u total  |  %6u disconnections     ║\n",
-           be_conn, be_disc);
+    printf("   Sent: %10lu msgs  |  %10lu bytes\n", be_sent, be_bytes_s);
+    printf("   Received: %10lu msgs  |  %10lu bytes\n", be_recv, be_bytes_r);
+    printf("   Connections: %6u total  |  %6u disconnections\n", be_conn,
+           be_disc);
 
     // Queue Statistics
-    printf(
-        "╟────────────────────────────────────────────────────────────────╢\n");
-    printf(
-        "║ Queue Statistics:                                              ║\n");
+    printf("Queue Statistics:\n");
     uint32_t q1_depth = queue_depth(&q_ws_to_backend);
     uint32_t q1_drops = atomic_load(&q_ws_to_backend.drops);
     uint32_t q1_hw = atomic_load(&q_ws_to_backend.high_water);
-    printf("║   WS→Backend:  depth=%4u | drops=%6u | HW=%4u          ║\n",
-           q1_depth, q1_drops, q1_hw);
+    printf("   WS→Backend:  depth=%4u | drops=%6u | HW=%4u\n", q1_depth,
+           q1_drops, q1_hw);
 
     uint32_t q2_depth = queue_depth(&q_backend_to_ws);
     uint32_t q2_drops = atomic_load(&q_backend_to_ws.drops);
     uint32_t q2_hw = atomic_load(&q_backend_to_ws.high_water);
-    printf("║   Backend→WS:  depth=%4u | drops=%6u | HW=%4u          ║\n",
-           q2_depth, q2_drops, q2_hw);
-
-    printf("╚════════════════════════════════════════════════════════════════╝"
-           "\n\n");
+    printf("   Backend→WS:  depth=%4u | drops=%6u | HW=%4u\n", q2_depth,
+           q2_drops, q2_hw);
   }
 
   printf("[Monitor] Stopped\n");
