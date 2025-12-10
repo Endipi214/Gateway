@@ -18,6 +18,22 @@
 
 pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// Helper structure to track pending sends for WebSocket
+typedef struct {
+  message_t *msg;
+  int in_progress;
+} ws_pending_send_t;
+
+// Helper structure to track pending sends for Backend
+typedef struct {
+  message_t *msg;
+  uint32_t backend_id;
+  int in_progress;
+} backend_pending_send_t;
+
+static ws_pending_send_t ws_pending_sends[MAX_CLIENTS] = {0};
+static backend_pending_send_t backend_pending_sends[MAX_BACKENDS] = {0};
+
 void *ws_thread_fn(void *arg) {
   int listen_fd = *(int *)arg;
   int epoll_fd = epoll_create1(0);
@@ -42,10 +58,28 @@ void *ws_thread_fn(void *arg) {
   struct epoll_event events[EPOLL_EVENTS];
 
   while (atomic_load_explicit(&running, memory_order_acquire)) {
-    // Process outgoing messages
+    // Process outgoing messages from queue
     message_t *msg;
     while ((msg = queue_pop(&q_backend_to_ws)) != NULL) {
-      if (send_ws_frame(msg->client_fd, msg) == 0) {
+      int client_idx = msg->client_fd % MAX_CLIENTS;
+
+      // Check if there's already a pending send for this client
+      if (ws_pending_sends[client_idx].in_progress) {
+        // Can't send now, put back in queue or drop
+        // For simplicity, we'll drop here, but you could implement a retry
+        // queue
+        msg_free(msg);
+        continue;
+      }
+
+      // Start sending
+      ws_pending_sends[client_idx].msg = msg;
+      ws_pending_sends[client_idx].in_progress = 1;
+
+      int result = send_ws_frame(msg->client_fd, msg);
+
+      if (result == 0) {
+        // Complete send
         uint64_t latency = get_time_ns() - msg->timestamp_ns;
         atomic_fetch_add_explicit(&metrics_ws.messages_sent, 1,
                                   memory_order_relaxed);
@@ -55,8 +89,20 @@ void *ws_thread_fn(void *arg) {
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&metrics_ws.latency_count, 1,
                                   memory_order_relaxed);
+        msg_free(msg);
+        ws_pending_sends[client_idx].in_progress = 0;
+        ws_pending_sends[client_idx].msg = NULL;
+      } else if (result == 1) {
+        // Partial send - add EPOLLOUT to continue later
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+        ev.data.fd = msg->client_fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, msg->client_fd, &ev);
+      } else {
+        // Error - cleanup
+        msg_free(msg);
+        ws_pending_sends[client_idx].in_progress = 0;
+        ws_pending_sends[client_idx].msg = NULL;
       }
-      msg_free(msg);
     }
 
     int n = epoll_wait(epoll_fd, events, EPOLL_EVENTS, 100);
@@ -84,6 +130,10 @@ void *ws_thread_fn(void *arg) {
             clients[client_fd].fd = client_fd;
             clients[client_fd].state = CLIENT_STATE_HANDSHAKE;
             clients[client_fd].last_activity = time(NULL);
+
+            // Initialize send state
+            ws_pending_sends[client_fd % MAX_CLIENTS].in_progress = 0;
+            ws_pending_sends[client_fd % MAX_CLIENTS].msg = NULL;
           }
           pthread_mutex_unlock(&clients_lock);
 
@@ -94,6 +144,47 @@ void *ws_thread_fn(void *arg) {
           atomic_fetch_add_explicit(&metrics_ws.connections, 1,
                                     memory_order_relaxed);
         }
+        continue;
+      }
+
+      // Handle EPOLLOUT - continue pending send
+      if (events[i].events & EPOLLOUT) {
+        int client_idx = fd % MAX_CLIENTS;
+        if (ws_pending_sends[client_idx].in_progress) {
+          message_t *pending_msg = ws_pending_sends[client_idx].msg;
+          int result = send_ws_frame(fd, pending_msg);
+
+          if (result == 0) {
+            // Complete send
+            uint64_t latency = get_time_ns() - pending_msg->timestamp_ns;
+            atomic_fetch_add_explicit(&metrics_ws.messages_sent, 1,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&metrics_ws.bytes_sent, pending_msg->len,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&metrics_ws.latency_sum_ns, latency,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&metrics_ws.latency_count, 1,
+                                      memory_order_relaxed);
+            msg_free(pending_msg);
+            ws_pending_sends[client_idx].in_progress = 0;
+            ws_pending_sends[client_idx].msg = NULL;
+
+            // Remove EPOLLOUT
+            ev.events = EPOLLIN | EPOLLET;
+            ev.data.fd = fd;
+            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+          } else if (result == -1) {
+            // Error - cleanup
+            msg_free(pending_msg);
+            ws_pending_sends[client_idx].in_progress = 0;
+            ws_pending_sends[client_idx].msg = NULL;
+          }
+          // If result == 1 (still partial), keep EPOLLOUT and try again later
+        }
+      }
+
+      // Handle EPOLLIN
+      if (!(events[i].events & EPOLLIN)) {
         continue;
       }
 
@@ -143,15 +234,15 @@ void *ws_thread_fn(void *arg) {
       // Broadcast To All Backends
       int broadcast_count = 0;
 
-      for (int i = 0; i < backend_server_count; i++) {
-        if (atomic_load_explicit(&backends[i].connected,
+      for (int j = 0; j < backend_server_count; j++) {
+        if (atomic_load_explicit(&backends[j].connected,
                                  memory_order_acquire)) {
           // Create a separate message copy for each backend
           message_t *broadcast_msg = msg_alloc(msg->len);
           if (broadcast_msg) {
             // Copy the original message data
             broadcast_msg->client_fd = msg->client_fd;
-            broadcast_msg->backend_fd = backends[i].fd;
+            broadcast_msg->backend_fd = backends[j].fd;
             broadcast_msg->len = msg->len;
             broadcast_msg->timestamp_ns = msg->timestamp_ns;
             memcpy(broadcast_msg->data, msg->data, msg->len);
@@ -173,7 +264,6 @@ void *ws_thread_fn(void *arg) {
 
       // Free the original message
       msg_free(msg);
-      // ===============================================
     }
   }
 
@@ -202,13 +292,12 @@ void *backend_thread_fn(void *arg) {
   time_t last_reconnect = 0;
 
   while (atomic_load_explicit(&running, memory_order_acquire)) {
-    // Attempt to connect each slot to its corresponding backend server
+    // Attempt to connect/reconnect backends
     time_t now = time(NULL);
     if (now - last_reconnect >= RECONNECT_INTERVAL) {
       for (int i = 0; i < backend_server_count; i++) {
         if (!atomic_load_explicit(&backends[i].connected,
                                   memory_order_acquire)) {
-          // Connect slot i to backend server i
           int fd = connect_to_backend(backend_servers[i].host,
                                       backend_servers[i].port);
 
@@ -217,6 +306,10 @@ void *backend_thread_fn(void *arg) {
             atomic_store_explicit(&backends[i].connected, 1,
                                   memory_order_release);
             backends[i].reconnect_count++;
+
+            // Initialize send state
+            backend_pending_sends[fd % MAX_BACKENDS].in_progress = 0;
+            backend_pending_sends[fd % MAX_BACKENDS].msg = NULL;
 
             ev.events = EPOLLIN | EPOLLET;
             ev.data.fd = fd;
@@ -235,16 +328,60 @@ void *backend_thread_fn(void *arg) {
       last_reconnect = now;
     }
 
-    // Process outgoing messages
+    // Process outgoing messages from queue
     message_t *msg;
     while ((msg = queue_pop(&q_ws_to_backend)) != NULL) {
-      if (write_backend_frame(msg->backend_fd, msg) == 0) {
+      int backend_idx = msg->backend_fd % MAX_BACKENDS;
+
+      // Find which backend slot this fd belongs to
+      int backend_slot = -1;
+      for (int j = 0; j < backend_server_count; j++) {
+        if (backends[j].fd == msg->backend_fd) {
+          backend_slot = j;
+          break;
+        }
+      }
+
+      if (backend_slot == -1) {
+        // Backend not found, drop message
+        msg_free(msg);
+        continue;
+      }
+
+      // Check if there's already a pending send
+      if (backend_pending_sends[backend_idx].in_progress) {
+        // Drop or retry - for now we drop
+        msg_free(msg);
+        continue;
+      }
+
+      // Start sending (include backend_id in the frame)
+      backend_pending_sends[backend_idx].msg = msg;
+      backend_pending_sends[backend_idx].backend_id = backend_slot;
+      backend_pending_sends[backend_idx].in_progress = 1;
+
+      int result = write_backend_frame(msg->backend_fd, msg, backend_slot);
+
+      if (result == 0) {
+        // Complete send
         atomic_fetch_add_explicit(&metrics_backend.messages_sent, 1,
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&metrics_backend.bytes_sent, msg->len,
                                   memory_order_relaxed);
+        msg_free(msg);
+        backend_pending_sends[backend_idx].in_progress = 0;
+        backend_pending_sends[backend_idx].msg = NULL;
+      } else if (result == 1) {
+        // Partial send - add EPOLLOUT
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+        ev.data.fd = msg->backend_fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, msg->backend_fd, &ev);
+      } else {
+        // Error - cleanup
+        msg_free(msg);
+        backend_pending_sends[backend_idx].in_progress = 0;
+        backend_pending_sends[backend_idx].msg = NULL;
       }
-      msg_free(msg);
     }
 
     int n = epoll_wait(epoll_fd, events, EPOLL_EVENTS, 100);
@@ -254,6 +391,42 @@ void *backend_thread_fn(void *arg) {
 
       if (fd == eventfd_backend) {
         drain_eventfd(eventfd_backend);
+        continue;
+      }
+
+      // Handle EPOLLOUT - continue pending send
+      if (events[i].events & EPOLLOUT) {
+        int backend_idx = fd % MAX_BACKENDS;
+        if (backend_pending_sends[backend_idx].in_progress) {
+          message_t *pending_msg = backend_pending_sends[backend_idx].msg;
+          uint32_t backend_id = backend_pending_sends[backend_idx].backend_id;
+          int result = write_backend_frame(fd, pending_msg, backend_id);
+
+          if (result == 0) {
+            // Complete send
+            atomic_fetch_add_explicit(&metrics_backend.messages_sent, 1,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&metrics_backend.bytes_sent,
+                                      pending_msg->len, memory_order_relaxed);
+            msg_free(pending_msg);
+            backend_pending_sends[backend_idx].in_progress = 0;
+            backend_pending_sends[backend_idx].msg = NULL;
+
+            // Remove EPOLLOUT
+            ev.events = EPOLLIN | EPOLLET;
+            ev.data.fd = fd;
+            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+          } else if (result == -1) {
+            // Error - cleanup
+            msg_free(pending_msg);
+            backend_pending_sends[backend_idx].in_progress = 0;
+            backend_pending_sends[backend_idx].msg = NULL;
+          }
+        }
+      }
+
+      // Handle EPOLLIN
+      if (!(events[i].events & EPOLLIN)) {
         continue;
       }
 
@@ -273,6 +446,14 @@ void *backend_thread_fn(void *arg) {
                                         memory_order_relaxed);
               printf("[Backend] Disconnected from %s:%d (fd=%d, slot=%d)\n",
                      backend_servers[j].host, backend_servers[j].port, fd, j);
+
+              // Cleanup any pending send
+              int backend_idx = fd % MAX_BACKENDS;
+              if (backend_pending_sends[backend_idx].in_progress) {
+                msg_free(backend_pending_sends[backend_idx].msg);
+                backend_pending_sends[backend_idx].in_progress = 0;
+                backend_pending_sends[backend_idx].msg = NULL;
+              }
               break;
             }
           }
@@ -382,7 +563,7 @@ void *monitor_thread_fn(void *arg) {
         active_backends++;
     }
 
-    // Calculate broadcast multiplier (how many copies per message)
+    // Calculate broadcast multiplier
     float broadcast_ratio =
         (ws_recv > 0) ? (float)atomic_load(&metrics_backend.messages_sent) /
                             (float)ws_recv
@@ -398,12 +579,10 @@ void *monitor_thread_fn(void *arg) {
     // Show individual backend status
     if (backend_server_count > 0) {
       printf("Backend Connections:\n");
-      for (int i = 0; i < backend_server_count && i < 8;
-           i++) { // Limit to 8 for display
+      for (int i = 0; i < backend_server_count && i < 8; i++) {
         int connected = atomic_load(&backends[i].connected);
         uint32_t reconnects = backends[i].reconnect_count;
 
-        // Format: [slot] host:port status reconnects
         char status_icon = connected ? '+' : 'x';
         printf("   [%d] %-15s:%-5d  [%c]  reconnects: %3u\n", i,
                backend_servers[i].host, backend_servers[i].port, status_icon,

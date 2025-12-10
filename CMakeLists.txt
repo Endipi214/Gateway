@@ -17,8 +17,8 @@ add_executable(${PROJECT_NAME} ${SRC_FILES})
 # Include directories
 target_include_directories(${PROJECT_NAME} PRIVATE ${INCLUDE_DIR})
 
-# Architecture flags
-target_compile_options(${PROJECT_NAME} PRIVATE -march=native)
+# Architecture flags and memory model for large arrays
+target_compile_options(${PROJECT_NAME} PRIVATE -march=native -mcmodel=medium)
 
 # Define _GNU_SOURCE for all source files
 target_compile_definitions(${PROJECT_NAME} PRIVATE _GNU_SOURCE)

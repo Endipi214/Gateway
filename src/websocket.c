@@ -3,17 +3,43 @@
 #include <openssl/buffer.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 #include <unistd.h>
 
+#include "gateway.h"
 #include "mempool.h"
 #include "utils.h"
 #include "websocket.h"
 
-ws_state_t ws_states[MAX_CLIENTS];
+ws_state_t *ws_states = NULL;
+ws_send_state_t *ws_send_states = NULL;
+
+// Initialize WebSocket state arrays
+void ws_init(void) {
+  ws_states = calloc(MAX_CLIENTS, sizeof(ws_state_t));
+  ws_send_states = calloc(MAX_CLIENTS, sizeof(ws_send_state_t));
+
+  if (!ws_states || !ws_send_states) {
+    fprintf(stderr, "[WebSocket] Failed to allocate state arrays\n");
+    exit(1);
+  }
+
+  printf("[WebSocket] Initialized state arrays for %d clients\n", MAX_CLIENTS);
+}
+
+void ws_cleanup(void) {
+  if (ws_states) {
+    free(ws_states);
+    ws_states = NULL;
+  }
+  if (ws_send_states) {
+    free(ws_send_states);
+    ws_send_states = NULL;
+  }
+}
 
 // API
 // Encoding for WebSocket
@@ -38,7 +64,7 @@ char *base64_encode(const unsigned char *input, int length) {
   return result;
 }
 
-// WebSocket handskaking
+// WebSocket handshaking
 int handle_ws_handshake(int fd) {
   char buffer[4096];
   ssize_t n = recv(fd, buffer, sizeof(buffer) - 1, 0);
@@ -90,18 +116,26 @@ int handle_ws_handshake(int fd) {
 message_t *parse_ws_frame(int fd) {
   ws_state_t *st = &ws_states[fd % MAX_CLIENTS];
 
+  // Try to receive data
   ssize_t n =
       recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos, MSG_DONTWAIT);
 
-  if (n <= 0) {
-    if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-      return NULL;
+  if (n < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return NULL; // No data available
     }
+    // Real error or connection closed
+    return NULL;
+  }
+
+  if (n == 0) {
+    // Connection closed
     return NULL;
   }
 
   st->pos += n;
 
+  // Need at least 2 bytes for basic header
   if (st->pos < 2)
     return NULL;
 
@@ -113,6 +147,7 @@ message_t *parse_ws_frame(int fd) {
     return NULL;
   }
 
+  // Only handle complete frames (FIN=1)
   if (!(fin_opcode & WS_FIN))
     return NULL;
 
@@ -120,14 +155,15 @@ message_t *parse_ws_frame(int fd) {
   uint64_t payload_len = mask_len & 0x7F;
   uint32_t header_size = 2;
 
+  // Extended payload length
   if (payload_len == 126) {
     if (st->pos < 4)
-      return NULL;
+      return NULL; // Need more data
     payload_len = (st->buffer[2] << 8) | st->buffer[3];
     header_size = 4;
   } else if (payload_len == 127) {
     if (st->pos < 10)
-      return NULL;
+      return NULL; // Need more data
     payload_len = 0;
     for (int i = 0; i < 8; i++) {
       payload_len = (payload_len << 8) | st->buffer[2 + i];
@@ -135,15 +171,20 @@ message_t *parse_ws_frame(int fd) {
     header_size = 10;
   }
 
+  // Add mask size if present
   if (masked)
     header_size += 4;
 
   uint32_t frame_size = header_size + payload_len;
-  if (st->pos < frame_size)
-    return NULL;
 
+  // Check if we have the complete frame
+  if (st->pos < frame_size)
+    return NULL; // Need more data
+
+  // Allocate message
   message_t *msg = msg_alloc(payload_len);
   if (!msg) {
+    // Allocation failed, drop frame and reset
     st->pos = 0;
     return NULL;
   }
@@ -152,6 +193,7 @@ message_t *parse_ws_frame(int fd) {
   msg->len = payload_len;
   msg->timestamp_ns = get_time_ns();
 
+  // Unmask and copy payload
   if (masked) {
     uint8_t *mask = &st->buffer[header_size - 4];
     uint8_t *payload = &st->buffer[header_size];
@@ -162,7 +204,7 @@ message_t *parse_ws_frame(int fd) {
     memcpy(msg->data, &st->buffer[header_size], payload_len);
   }
 
-  // Shift remaining data
+  // Shift remaining data (next frame)
   if (st->pos > frame_size) {
     memmove(st->buffer, st->buffer + frame_size, st->pos - frame_size);
     st->pos -= frame_size;
@@ -174,32 +216,76 @@ message_t *parse_ws_frame(int fd) {
 }
 
 int send_ws_frame(int fd, message_t *msg) {
-  uint8_t header[10];
-  uint32_t header_len = 2;
+  ws_send_state_t *ss = &ws_send_states[fd % MAX_CLIENTS];
 
-  header[0] = WS_FIN | WS_OPCODE_BIN;
+  // First call for this message - initialize send state
+  if (ss->header_sent == 0 && ss->data_sent == 0) {
+    ss->total_len = msg->len;
+    ss->header_len = 2;
 
-  if (msg->len < 126) {
-    header[1] = msg->len;
-  } else if (msg->len < 65536) {
-    header[1] = 126;
-    header[2] = (msg->len >> 8) & 0xFF;
-    header[3] = msg->len & 0xFF;
-    header_len = 4;
-  } else {
-    header[1] = 127;
-    for (int i = 0; i < 8; i++) {
-      header[2 + i] = (msg->len >> (56 - i * 8)) & 0xFF;
+    // Build header
+    ss->header[0] = WS_FIN | WS_OPCODE_BIN;
+
+    if (msg->len < 126) {
+      ss->header[1] = msg->len;
+      ss->header_len = 2;
+    } else if (msg->len < 65536) {
+      ss->header[1] = 126;
+      ss->header[2] = (msg->len >> 8) & 0xFF;
+      ss->header[3] = msg->len & 0xFF;
+      ss->header_len = 4;
+    } else {
+      ss->header[1] = 127;
+      for (int i = 0; i < 8; i++) {
+        ss->header[2 + i] = (msg->len >> (56 - i * 8)) & 0xFF;
+      }
+      ss->header_len = 10;
     }
-    header_len = 10;
   }
 
-  struct iovec iov[2];
-  iov[0].iov_base = header;
-  iov[0].iov_len = header_len;
-  iov[1].iov_base = msg->data;
-  iov[1].iov_len = msg->len;
+  // Step 1: Send header if not complete
+  while (ss->header_sent < ss->header_len) {
+    ssize_t sent =
+        send(fd, ss->header + ss->header_sent, ss->header_len - ss->header_sent,
+             MSG_DONTWAIT | MSG_NOSIGNAL);
 
-  ssize_t sent = writev(fd, iov, 2);
-  return (sent == (ssize_t)(header_len + msg->len)) ? 0 : -1;
+    if (sent < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return 1; // Partial send, call again later
+      }
+      // Error occurred
+      ss->header_sent = 0;
+      ss->data_sent = 0;
+      return -1;
+    }
+
+    ss->header_sent += sent;
+  }
+
+  // Step 2: Send payload data
+  while (ss->data_sent < ss->total_len) {
+    ssize_t sent =
+        send(fd, msg->data + ss->data_sent, ss->total_len - ss->data_sent,
+             MSG_DONTWAIT | MSG_NOSIGNAL);
+
+    if (sent < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return 1; // Partial send, call again later
+      }
+      // Error occurred
+      ss->header_sent = 0;
+      ss->data_sent = 0;
+      return -1;
+    }
+
+    ss->data_sent += sent;
+  }
+
+  // Complete send - reset state
+  ss->header_sent = 0;
+  ss->data_sent = 0;
+  ss->header_len = 0;
+  ss->total_len = 0;
+
+  return 0; // Success
 }

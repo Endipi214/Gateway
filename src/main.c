@@ -10,12 +10,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "backend.h"
 #include "gateway.h"
 #include "mempool.h"
 #include "metrics.h"
 #include "queue.h"
 #include "thread.h"
 #include "utils.h"
+#include "websocket.h"
 
 int eventfd_ws;
 int eventfd_backend;
@@ -104,21 +106,25 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
 
   // Initialize subsystems
+  printf("[Main] Initializing subsystems...\n");
   pool_init();
   queue_init(&q_ws_to_backend);
   queue_init(&q_backend_to_ws);
+  ws_init();      // NEW: Initialize WebSocket state arrays
+  backend_init(); // NEW: Initialize backend state arrays
 
   // Initialize client array
   for (int i = 0; i < MAX_CLIENTS; i++) {
     clients[i].fd = -1;
   }
-  // NEW: Initialize backend array
+  // Initialize backend array
   for (int i = 0; i < MAX_BACKEND_SERVERS; i++) {
     backends[i].fd = -1;
     atomic_store(&backends[i].connected, 0);
     backends[i].last_attempt = 0;
     backends[i].reconnect_count = 0;
   }
+
   // Create eventfds
   eventfd_ws = eventfd(0, EFD_NONBLOCK);
   eventfd_backend = eventfd(0, EFD_NONBLOCK);
@@ -181,6 +187,8 @@ int main(int argc, char **argv) {
   close(eventfd_ws);
   close(eventfd_backend);
   pool_cleanup();
+  ws_cleanup();      // NEW: Cleanup WebSocket state arrays
+  backend_cleanup(); // NEW: Cleanup backend state arrays
 
   printf("\n[Main] Gateway stopped cleanly.\n");
   return 0;
