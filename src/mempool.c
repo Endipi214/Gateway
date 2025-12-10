@@ -135,8 +135,8 @@ message_t *msg_alloc(uint32_t size) {
           (message_t *)((uint8_t *)tier->pool + idx * tier->slot_size);
 
       // Initialize message metadata
-      msg->client_fd = 0;
-      msg->backend_fd = 0;
+      msg->client_id = 0;
+      msg->backend_id = 0;
       msg->len = 0;
       msg->capacity = tier->data_size;
       msg->tier = tier_idx;

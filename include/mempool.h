@@ -29,11 +29,11 @@
 // --------- Message Structure ---------
 // Variable-size message structure
 typedef struct {
-  uint32_t client_fd;
-  uint32_t backend_fd;
-  uint32_t len;      // Actual data length
-  uint32_t capacity; // Allocated capacity (tier size)
-  uint8_t tier;      // Which tier this came from
+  uint32_t client_id;  // Client ID (sender or destination)
+  uint32_t backend_id; // Backend ID (sender or destination)
+  uint32_t len;        // Actual data length
+  uint32_t capacity;   // Allocated capacity (tier size)
+  uint8_t tier;        // Which tier this came from
   uint64_t timestamp_ns;
   uint8_t data[];
 } message_t;

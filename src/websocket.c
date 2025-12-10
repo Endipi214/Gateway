@@ -236,7 +236,6 @@ message_t *parse_ws_frame(int fd) {
     return NULL;
   }
 
-  msg->client_fd = fd;
   msg->len = payload_len;
   msg->timestamp_ns = get_time_ns();
 

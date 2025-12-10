@@ -53,6 +53,7 @@ message_t *read_backend_frame(int fd) {
       fprintf(stderr, "[Backend] Buffer overflow on fd %d, resetting\n", fd);
       st->pos = 0;
       st->expected_len = 0;
+      st->client_id = 0;
       st->backend_id = 0;
       st->header_complete = 0;
       return NULL;
@@ -67,6 +68,7 @@ message_t *read_backend_frame(int fd) {
       // Real error - reset state
       st->pos = 0;
       st->expected_len = 0;
+      st->client_id = 0;
       st->backend_id = 0;
       st->header_complete = 0;
       return NULL;
@@ -76,6 +78,7 @@ message_t *read_backend_frame(int fd) {
       // Connection closed - reset state
       st->pos = 0;
       st->expected_len = 0;
+      st->client_id = 0;
       st->backend_id = 0;
       st->header_complete = 0;
       return NULL;
@@ -89,7 +92,7 @@ message_t *read_backend_frame(int fd) {
     }
   }
 
-  // Step 1: Read header (8 bytes: 4 len + 4 backend_id)
+  // Step 1: Read header (12 bytes: 4 len + 4 client_id + 4 backend_id)
   if (!st->header_complete) {
     if (st->pos < BACKEND_HEADER_SIZE) {
       // Need more header data - try one more recv
@@ -105,12 +108,14 @@ message_t *read_backend_frame(int fd) {
     }
 
     // Parse header
-    uint32_t network_len, network_id;
+    uint32_t network_len, network_client_id, network_backend_id;
     memcpy(&network_len, st->buffer, 4);
-    memcpy(&network_id, st->buffer + 4, 4);
+    memcpy(&network_client_id, st->buffer + 4, 4);
+    memcpy(&network_backend_id, st->buffer + 8, 4);
 
     st->expected_len = ntohl(network_len);
-    st->backend_id = ntohl(network_id);
+    st->client_id = ntohl(network_client_id);
+    st->backend_id = ntohl(network_backend_id);
     st->header_complete = 1;
 
     // Validate length
@@ -120,6 +125,7 @@ message_t *read_backend_frame(int fd) {
       // Invalid frame, reset state
       st->pos = 0;
       st->expected_len = 0;
+      st->client_id = 0;
       st->backend_id = 0;
       st->header_complete = 0;
       return NULL;
@@ -145,6 +151,7 @@ message_t *read_backend_frame(int fd) {
         // Real error - reset state
         st->pos = 0;
         st->expected_len = 0;
+        st->client_id = 0;
         st->backend_id = 0;
         st->header_complete = 0;
         return NULL;
@@ -154,6 +161,7 @@ message_t *read_backend_frame(int fd) {
         // Connection closed mid-frame - reset state
         st->pos = 0;
         st->expected_len = 0;
+        st->client_id = 0;
         st->backend_id = 0;
         st->header_complete = 0;
         return NULL;
@@ -183,12 +191,14 @@ message_t *read_backend_frame(int fd) {
             st->expected_len);
     st->pos = 0;
     st->expected_len = 0;
+    st->client_id = 0;
     st->backend_id = 0;
     st->header_complete = 0;
     return NULL;
   }
 
-  msg->backend_fd = fd;
+  msg->client_id = st->client_id;
+  msg->backend_id = st->backend_id;
   msg->len = st->expected_len;
   msg->timestamp_ns = get_time_ns();
 
@@ -207,24 +217,28 @@ message_t *read_backend_frame(int fd) {
 
   // Reset state for next frame
   st->expected_len = 0;
+  st->client_id = 0;
   st->backend_id = 0;
   st->header_complete = 0;
 
   return msg;
 }
 
-int write_backend_frame(int fd, message_t *msg, uint32_t backend_id) {
+int write_backend_frame(int fd, message_t *msg, uint32_t client_id,
+                        uint32_t backend_id) {
   backend_send_state_t *ss = &backend_send_states[fd % MAX_BACKENDS];
 
   // First call for this message - initialize send state
   if (ss->header_sent == 0 && ss->data_sent == 0) {
     ss->total_len = msg->len;
 
-    // Prepare header: [4 bytes len][4 bytes backend_id]
+    // Prepare header: [4 bytes len][4 bytes client_id][4 bytes backend_id]
     uint32_t network_len = htonl(msg->len);
-    uint32_t network_id = htonl(backend_id);
+    uint32_t network_client_id = htonl(client_id);
+    uint32_t network_backend_id = htonl(backend_id);
     memcpy(ss->header, &network_len, 4);
-    memcpy(ss->header + 4, &network_id, 4);
+    memcpy(ss->header + 4, &network_client_id, 4);
+    memcpy(ss->header + 8, &network_backend_id, 4);
   }
 
   // Step 1: Send header if not complete

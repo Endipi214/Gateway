@@ -7,15 +7,21 @@
 // ---------- Backend Protocol ----------
 // Frame format:
 // [4 bytes: payload length (network order)]
-// [4 bytes: backend_id (network order)]
-// [N bytes: payload data]
-#define BACKEND_HEADER_SIZE 8
+// [4 bytes: client_id (network order)] - sender if from backend, dest if from
+// client [4 bytes: backend_id (network order)] - sender if from client, dest if
+// from backend [N bytes: payload data]
+//
+// Special IDs:
+// client_id = 0: broadcast to all clients
+// backend_id = 0: broadcast to all backends
+#define BACKEND_HEADER_SIZE 12
 
 // ---------- Backend struct ---------
 typedef struct {
   uint8_t buffer[MAX_MESSAGE_SIZE + BACKEND_HEADER_SIZE];
   uint32_t pos;            // Current position in buffer
   uint32_t expected_len;   // Expected payload length
+  uint32_t client_id;      // Client ID from header
   uint32_t backend_id;     // Backend ID from header
   uint8_t header_complete; // Have we read the full header?
 } backend_state_t;
@@ -37,7 +43,8 @@ extern backend_send_state_t *backend_send_states;
 message_t *read_backend_frame(int fd);
 
 // Returns: 0 if complete, 1 if partial (call again), -1 on error
-int write_backend_frame(int fd, message_t *msg, uint32_t backend_id);
+int write_backend_frame(int fd, message_t *msg, uint32_t client_id,
+                        uint32_t backend_id);
 
 // Connection management
 int connect_to_backend(const char *host, int port);
