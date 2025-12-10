@@ -53,7 +53,7 @@ void *ws_thread_fn(void *arg) {
   ev.data.fd = eventfd_ws;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventfd_ws, &ev);
 
-  printf("[WS Thread] Started on port %d (BROADCAST MODE)\n", ws_port);
+  printf("[WS Thread] Started on port %d\n", ws_port);
 
   struct epoll_event events[EPOLL_EVENTS];
 
@@ -61,13 +61,39 @@ void *ws_thread_fn(void *arg) {
     // Process outgoing messages from queue
     message_t *msg;
     while ((msg = queue_pop(&q_backend_to_ws)) != NULL) {
-      int client_idx = msg->client_fd % MAX_CLIENTS;
+      int client_fd = msg->client_fd;
+      int client_idx = client_fd % MAX_CLIENTS;
+
+      // Validate client_fd
+      if (client_fd < 0 || client_fd >= MAX_CLIENTS) {
+        fprintf(stderr,
+                "[WS Thread] Invalid client_fd=%d in message, dropping\n",
+                client_fd);
+        msg_free(msg);
+        continue;
+      }
+
+      // Check if client is still connected
+      pthread_mutex_lock(&clients_lock);
+      int client_valid = (clients[client_fd].fd == client_fd &&
+                          clients[client_fd].state == CLIENT_STATE_ACTIVE);
+      pthread_mutex_unlock(&clients_lock);
+
+      if (!client_valid) {
+        fprintf(stderr,
+                "[WS Thread] Client fd=%d not valid/active, dropping message "
+                "(%u bytes)\n",
+                client_fd, msg->len);
+        msg_free(msg);
+        continue;
+      }
 
       // Check if there's already a pending send for this client
       if (ws_pending_sends[client_idx].in_progress) {
-        // Can't send now, put back in queue or drop
-        // For simplicity, we'll drop here, but you could implement a retry
-        // queue
+        fprintf(
+            stderr,
+            "[WS Thread] Client fd=%d has pending send, dropping new message\n",
+            client_fd);
         msg_free(msg);
         continue;
       }
@@ -76,7 +102,7 @@ void *ws_thread_fn(void *arg) {
       ws_pending_sends[client_idx].msg = msg;
       ws_pending_sends[client_idx].in_progress = 1;
 
-      int result = send_ws_frame(msg->client_fd, msg);
+      int result = send_ws_frame(client_fd, msg);
 
       if (result == 0) {
         // Complete send
@@ -89,16 +115,23 @@ void *ws_thread_fn(void *arg) {
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&metrics_ws.latency_count, 1,
                                   memory_order_relaxed);
+        printf("[WS Thread] Sent %u bytes to client fd=%d\n", msg->len,
+               client_fd);
         msg_free(msg);
         ws_pending_sends[client_idx].in_progress = 0;
         ws_pending_sends[client_idx].msg = NULL;
       } else if (result == 1) {
         // Partial send - add EPOLLOUT to continue later
+        printf(
+            "[WS Thread] Partial send to client fd=%d, waiting for EPOLLOUT\n",
+            client_fd);
         ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-        ev.data.fd = msg->client_fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, msg->client_fd, &ev);
+        ev.data.fd = client_fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev);
       } else {
         // Error - cleanup
+        fprintf(stderr, "[WS Thread] Error sending to client fd=%d\n",
+                client_fd);
         msg_free(msg);
         ws_pending_sends[client_idx].in_progress = 0;
         ws_pending_sends[client_idx].msg = NULL;
@@ -134,6 +167,8 @@ void *ws_thread_fn(void *arg) {
             // Initialize send state
             ws_pending_sends[client_fd % MAX_CLIENTS].in_progress = 0;
             ws_pending_sends[client_fd % MAX_CLIENTS].msg = NULL;
+
+            printf("[WS Thread] New connection: fd=%d\n", client_fd);
           }
           pthread_mutex_unlock(&clients_lock);
 
@@ -165,6 +200,8 @@ void *ws_thread_fn(void *arg) {
                                       memory_order_relaxed);
             atomic_fetch_add_explicit(&metrics_ws.latency_count, 1,
                                       memory_order_relaxed);
+            printf("[WS Thread] Completed partial send: %u bytes to fd=%d\n",
+                   pending_msg->len, fd);
             msg_free(pending_msg);
             ws_pending_sends[client_idx].in_progress = 0;
             ws_pending_sends[client_idx].msg = NULL;
@@ -175,6 +212,7 @@ void *ws_thread_fn(void *arg) {
             epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
           } else if (result == -1) {
             // Error - cleanup
+            fprintf(stderr, "[WS Thread] Error completing send to fd=%d\n", fd);
             msg_free(pending_msg);
             ws_pending_sends[client_idx].in_progress = 0;
             ws_pending_sends[client_idx].msg = NULL;
@@ -198,7 +236,9 @@ void *ws_thread_fn(void *arg) {
       if (clients[fd].state == CLIENT_STATE_HANDSHAKE) {
         if (handle_ws_handshake(fd) == 0) {
           clients[fd].state = CLIENT_STATE_ACTIVE;
+          printf("[WS Thread] Handshake complete for fd=%d\n", fd);
         } else {
+          printf("[WS Thread] Handshake failed for fd=%d\n", fd);
           epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
           close(fd);
           clients[fd].fd = -1;
@@ -214,6 +254,7 @@ void *ws_thread_fn(void *arg) {
       message_t *msg = parse_ws_frame(fd);
       if (!msg) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
+          printf("[WS Thread] Client fd=%d disconnected or error\n", fd);
           epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
           close(fd);
           pthread_mutex_lock(&clients_lock);
@@ -230,6 +271,8 @@ void *ws_thread_fn(void *arg) {
                                 memory_order_relaxed);
       atomic_fetch_add_explicit(&metrics_ws.bytes_recv, msg->len,
                                 memory_order_relaxed);
+
+      printf("[WS Thread] Received %u bytes from client fd=%d\n", msg->len, fd);
 
       // Broadcast To All Backends
       int broadcast_count = 0;
@@ -343,14 +386,17 @@ void *backend_thread_fn(void *arg) {
       }
 
       if (backend_slot == -1) {
-        // Backend not found, drop message
+        fprintf(stderr, "[Backend] Backend fd=%d not found, dropping message\n",
+                msg->backend_fd);
         msg_free(msg);
         continue;
       }
 
       // Check if there's already a pending send
       if (backend_pending_sends[backend_idx].in_progress) {
-        // Drop or retry - for now we drop
+        fprintf(stderr,
+                "[Backend] Backend fd=%d has pending send, dropping message\n",
+                msg->backend_fd);
         msg_free(msg);
         continue;
       }
@@ -368,16 +414,23 @@ void *backend_thread_fn(void *arg) {
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&metrics_backend.bytes_sent, msg->len,
                                   memory_order_relaxed);
+        printf("[Backend] Sent %u bytes to backend fd=%d (slot=%d)\n", msg->len,
+               msg->backend_fd, backend_slot);
         msg_free(msg);
         backend_pending_sends[backend_idx].in_progress = 0;
         backend_pending_sends[backend_idx].msg = NULL;
       } else if (result == 1) {
         // Partial send - add EPOLLOUT
+        printf(
+            "[Backend] Partial send to backend fd=%d, waiting for EPOLLOUT\n",
+            msg->backend_fd);
         ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
         ev.data.fd = msg->backend_fd;
         epoll_ctl(epoll_fd, EPOLL_CTL_MOD, msg->backend_fd, &ev);
       } else {
         // Error - cleanup
+        fprintf(stderr, "[Backend] Error sending to backend fd=%d\n",
+                msg->backend_fd);
         msg_free(msg);
         backend_pending_sends[backend_idx].in_progress = 0;
         backend_pending_sends[backend_idx].msg = NULL;
@@ -408,6 +461,8 @@ void *backend_thread_fn(void *arg) {
                                       memory_order_relaxed);
             atomic_fetch_add_explicit(&metrics_backend.bytes_sent,
                                       pending_msg->len, memory_order_relaxed);
+            printf("[Backend] Completed partial send: %u bytes to fd=%d\n",
+                   pending_msg->len, fd);
             msg_free(pending_msg);
             backend_pending_sends[backend_idx].in_progress = 0;
             backend_pending_sends[backend_idx].msg = NULL;
@@ -418,6 +473,7 @@ void *backend_thread_fn(void *arg) {
             epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
           } else if (result == -1) {
             // Error - cleanup
+            fprintf(stderr, "[Backend] Error completing send to fd=%d\n", fd);
             msg_free(pending_msg);
             backend_pending_sends[backend_idx].in_progress = 0;
             backend_pending_sends[backend_idx].msg = NULL;
@@ -466,7 +522,14 @@ void *backend_thread_fn(void *arg) {
       atomic_fetch_add_explicit(&metrics_backend.bytes_recv, msg->len,
                                 memory_order_relaxed);
 
+      printf("[Backend] Received %u bytes from backend fd=%d, routing to "
+             "client fd=%d\n",
+             msg->len, fd, msg->client_fd);
+
       if (!queue_push(&q_backend_to_ws, msg)) {
+        fprintf(stderr,
+                "[Backend] Queue full, dropping message to client fd=%d\n",
+                msg->client_fd);
         msg_free(msg);
       } else {
         signal_eventfd(eventfd_ws);
@@ -492,6 +555,7 @@ void *monitor_thread_fn(void *arg) {
   while (atomic_load_explicit(&running, memory_order_acquire)) {
     sleep(5);
 
+    printf("═══════════════════════════════════════════════════════════════\n");
     printf("Tiered Memory Pool:\n");
 
     // Global pool statistics
@@ -621,6 +685,8 @@ void *monitor_thread_fn(void *arg) {
     uint32_t q2_hw = atomic_load(&q_backend_to_ws.high_water);
     printf("   Backend→WS:  depth=%4u | drops=%6u | HW=%4u\n", q2_depth,
            q2_drops, q2_hw);
+    printf(
+        "═══════════════════════════════════════════════════════════════\n\n");
   }
 
   printf("[Monitor] Stopped\n");

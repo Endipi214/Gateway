@@ -116,24 +116,34 @@ int handle_ws_handshake(int fd) {
 message_t *parse_ws_frame(int fd) {
   ws_state_t *st = &ws_states[fd % MAX_CLIENTS];
 
-  // Try to receive data
-  ssize_t n =
-      recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos, MSG_DONTWAIT);
+  // Try to receive data - loop to handle multiple recv calls for fragmented
+  // data
+  while (1) {
+    ssize_t n = recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos,
+                     MSG_DONTWAIT);
 
-  if (n < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return NULL; // No data available
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break; // No more data available right now
+      }
+      // Real error
+      st->pos = 0; // Reset state on error
+      return NULL;
     }
-    // Real error or connection closed
-    return NULL;
-  }
 
-  if (n == 0) {
-    // Connection closed
-    return NULL;
-  }
+    if (n == 0) {
+      // Connection closed
+      st->pos = 0; // Reset state
+      return NULL;
+    }
 
-  st->pos += n;
+    st->pos += n;
+
+    // Try to parse if we might have enough data
+    if (st->pos >= 2) {
+      break; // Have at least basic header, try parsing
+    }
+  }
 
   // Need at least 2 bytes for basic header
   if (st->pos < 2)
@@ -144,12 +154,20 @@ message_t *parse_ws_frame(int fd) {
 
   uint8_t opcode = fin_opcode & 0x0F;
   if (opcode == WS_OPCODE_CLOSE) {
+    st->pos = 0; // Reset state
     return NULL;
   }
 
   // Only handle complete frames (FIN=1)
-  if (!(fin_opcode & WS_FIN))
+  if (!(fin_opcode & WS_FIN)) {
+    // Fragmented frame - for now, reset and wait
+    // A full implementation would accumulate fragments
+    if (st->pos >= MAX_MESSAGE_SIZE - 1024) {
+      // Buffer nearly full, reset to prevent overflow
+      st->pos = 0;
+    }
     return NULL;
+  }
 
   int masked = mask_len & WS_MASK;
   uint64_t payload_len = mask_len & 0x7F;
@@ -158,12 +176,12 @@ message_t *parse_ws_frame(int fd) {
   // Extended payload length
   if (payload_len == 126) {
     if (st->pos < 4)
-      return NULL; // Need more data
+      return NULL; // Need more data for extended length
     payload_len = (st->buffer[2] << 8) | st->buffer[3];
     header_size = 4;
   } else if (payload_len == 127) {
     if (st->pos < 10)
-      return NULL; // Need more data
+      return NULL; // Need more data for extended length
     payload_len = 0;
     for (int i = 0; i < 8; i++) {
       payload_len = (payload_len << 8) | st->buffer[2 + i];
@@ -177,14 +195,43 @@ message_t *parse_ws_frame(int fd) {
 
   uint32_t frame_size = header_size + payload_len;
 
-  // Check if we have the complete frame
-  if (st->pos < frame_size)
-    return NULL; // Need more data
+  // Validate frame size
+  if (frame_size > MAX_MESSAGE_SIZE) {
+    fprintf(stderr, "[WebSocket] Frame too large: %u bytes (max: %u)\n",
+            frame_size, MAX_MESSAGE_SIZE);
+    st->pos = 0; // Reset state
+    return NULL;
+  }
 
+  // Check if we have the complete frame
+  if (st->pos < frame_size) {
+    // Need more data - frame is incomplete
+    // Try to read more immediately if buffer has space
+    if (st->pos < MAX_MESSAGE_SIZE - 1024) {
+      ssize_t n = recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos,
+                       MSG_DONTWAIT);
+      if (n > 0) {
+        st->pos += n;
+        // Check again if frame is complete now
+        if (st->pos < frame_size) {
+          return NULL; // Still incomplete
+        }
+      } else {
+        return NULL; // No more data available
+      }
+    } else {
+      return NULL; // Need more data but buffer getting full
+    }
+  }
+
+  // At this point we have a complete frame
   // Allocate message
   message_t *msg = msg_alloc(payload_len);
   if (!msg) {
     // Allocation failed, drop frame and reset
+    fprintf(stderr,
+            "[WebSocket] Failed to allocate message for %lu byte payload\n",
+            payload_len);
     st->pos = 0;
     return NULL;
   }
@@ -204,10 +251,11 @@ message_t *parse_ws_frame(int fd) {
     memcpy(msg->data, &st->buffer[header_size], payload_len);
   }
 
-  // Shift remaining data (next frame)
+  // Shift remaining data (next frame if any)
   if (st->pos > frame_size) {
-    memmove(st->buffer, st->buffer + frame_size, st->pos - frame_size);
-    st->pos -= frame_size;
+    uint32_t remaining = st->pos - frame_size;
+    memmove(st->buffer, st->buffer + frame_size, remaining);
+    st->pos = remaining;
   } else {
     st->pos = 0;
   }

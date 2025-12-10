@@ -44,27 +44,67 @@ void backend_cleanup(void) {
 message_t *read_backend_frame(int fd) {
   backend_state_t *st = &backend_states[fd % MAX_BACKENDS];
 
-  // Try to receive data
-  ssize_t n = recv(fd, st->buffer + st->pos, sizeof(st->buffer) - st->pos,
-                   MSG_DONTWAIT);
-
-  if (n < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return NULL; // No data available, try again later
+  // Try to receive data - loop to handle multiple recv calls for fragmented
+  // data
+  while (1) {
+    size_t space_available = sizeof(st->buffer) - st->pos;
+    if (space_available == 0) {
+      // Buffer full but frame not complete - this is an error
+      fprintf(stderr, "[Backend] Buffer overflow on fd %d, resetting\n", fd);
+      st->pos = 0;
+      st->expected_len = 0;
+      st->backend_id = 0;
+      st->header_complete = 0;
+      return NULL;
     }
-    // Real error
-    return NULL;
-  }
 
-  if (n == 0) {
-    // Connection closed
-    return NULL;
-  }
+    ssize_t n = recv(fd, st->buffer + st->pos, space_available, MSG_DONTWAIT);
 
-  st->pos += n;
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break; // No more data available right now
+      }
+      // Real error - reset state
+      st->pos = 0;
+      st->expected_len = 0;
+      st->backend_id = 0;
+      st->header_complete = 0;
+      return NULL;
+    }
+
+    if (n == 0) {
+      // Connection closed - reset state
+      st->pos = 0;
+      st->expected_len = 0;
+      st->backend_id = 0;
+      st->header_complete = 0;
+      return NULL;
+    }
+
+    st->pos += n;
+
+    // Try to parse if we might have enough data
+    if (st->pos >= BACKEND_HEADER_SIZE) {
+      break; // Have at least header, try parsing
+    }
+  }
 
   // Step 1: Read header (8 bytes: 4 len + 4 backend_id)
-  if (!st->header_complete && st->pos >= BACKEND_HEADER_SIZE) {
+  if (!st->header_complete) {
+    if (st->pos < BACKEND_HEADER_SIZE) {
+      // Need more header data - try one more recv
+      ssize_t n = recv(fd, st->buffer + st->pos, BACKEND_HEADER_SIZE - st->pos,
+                       MSG_DONTWAIT);
+      if (n > 0) {
+        st->pos += n;
+      }
+
+      if (st->pos < BACKEND_HEADER_SIZE) {
+        return NULL; // Still don't have full header
+      }
+    }
+
+    // Parse header
     uint32_t network_len, network_id;
     memcpy(&network_len, st->buffer, 4);
     memcpy(&network_id, st->buffer + 4, 4);
@@ -75,6 +115,8 @@ message_t *read_backend_frame(int fd) {
 
     // Validate length
     if (st->expected_len > MAX_MESSAGE_SIZE) {
+      fprintf(stderr, "[Backend] Invalid frame length: %u (max: %u)\n",
+              st->expected_len, MAX_MESSAGE_SIZE);
       // Invalid frame, reset state
       st->pos = 0;
       st->expected_len = 0;
@@ -85,45 +127,90 @@ message_t *read_backend_frame(int fd) {
   }
 
   // Step 2: Read payload
-  if (st->header_complete &&
-      st->pos >= BACKEND_HEADER_SIZE + st->expected_len) {
-    // Complete frame received
-    message_t *msg = msg_alloc(st->expected_len);
-    if (!msg) {
-      // Allocation failed, reset and drop frame
-      st->pos = 0;
-      st->expected_len = 0;
-      st->backend_id = 0;
-      st->header_complete = 0;
-      return NULL;
+  uint32_t total_frame_size = BACKEND_HEADER_SIZE + st->expected_len;
+
+  if (st->pos < total_frame_size) {
+    // Need more payload data - try to read more
+    while (st->pos < total_frame_size) {
+      size_t needed = total_frame_size - st->pos;
+      size_t space = sizeof(st->buffer) - st->pos;
+      size_t to_read = (needed < space) ? needed : space;
+
+      ssize_t n = recv(fd, st->buffer + st->pos, to_read, MSG_DONTWAIT);
+
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          return NULL; // No more data available, frame incomplete
+        }
+        // Real error - reset state
+        st->pos = 0;
+        st->expected_len = 0;
+        st->backend_id = 0;
+        st->header_complete = 0;
+        return NULL;
+      }
+
+      if (n == 0) {
+        // Connection closed mid-frame - reset state
+        st->pos = 0;
+        st->expected_len = 0;
+        st->backend_id = 0;
+        st->header_complete = 0;
+        return NULL;
+      }
+
+      st->pos += n;
+
+      if (n < (ssize_t)to_read) {
+        // Didn't get all requested data, would block on next recv
+        break;
+      }
     }
 
-    msg->backend_fd = fd;
-    msg->len = st->expected_len;
-    msg->timestamp_ns = get_time_ns();
-
-    // Copy payload data
-    memcpy(msg->data, st->buffer + BACKEND_HEADER_SIZE, st->expected_len);
-
-    // Handle remaining data in buffer (next frame)
-    uint32_t frame_size = BACKEND_HEADER_SIZE + st->expected_len;
-    if (st->pos > frame_size) {
-      memmove(st->buffer, st->buffer + frame_size, st->pos - frame_size);
-      st->pos -= frame_size;
-    } else {
-      st->pos = 0;
+    // Check if we have complete frame now
+    if (st->pos < total_frame_size) {
+      return NULL; // Still incomplete
     }
+  }
 
-    // Reset state for next frame
+  // At this point we have a complete frame
+  // Allocate message
+  message_t *msg = msg_alloc(st->expected_len);
+  if (!msg) {
+    // Allocation failed, drop frame and reset
+    fprintf(stderr,
+            "[Backend] Failed to allocate message for %u byte payload\n",
+            st->expected_len);
+    st->pos = 0;
     st->expected_len = 0;
     st->backend_id = 0;
     st->header_complete = 0;
-
-    return msg;
+    return NULL;
   }
 
-  // Incomplete frame, need more data
-  return NULL;
+  msg->backend_fd = fd;
+  msg->len = st->expected_len;
+  msg->timestamp_ns = get_time_ns();
+
+  // Copy payload data
+  memcpy(msg->data, st->buffer + BACKEND_HEADER_SIZE, st->expected_len);
+
+  // Handle remaining data in buffer (next frame if any)
+  uint32_t frame_size = BACKEND_HEADER_SIZE + st->expected_len;
+  if (st->pos > frame_size) {
+    uint32_t remaining = st->pos - frame_size;
+    memmove(st->buffer, st->buffer + frame_size, remaining);
+    st->pos = remaining;
+  } else {
+    st->pos = 0;
+  }
+
+  // Reset state for next frame
+  st->expected_len = 0;
+  st->backend_id = 0;
+  st->header_complete = 0;
+
+  return msg;
 }
 
 int write_backend_frame(int fd, message_t *msg, uint32_t backend_id) {
