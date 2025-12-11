@@ -85,11 +85,6 @@ message_t *read_backend_frame(int fd) {
     }
 
     st->pos += n;
-
-    // Try to parse if we might have enough data
-    if (st->pos >= BACKEND_HEADER_SIZE) {
-      break; // Have at least header, try parsing
-    }
   }
 
   // Step 1: Read header (12 bytes: 4 len + 4 client_id + 4 backend_id)

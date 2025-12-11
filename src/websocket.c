@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <errno.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -278,14 +279,17 @@ int send_ws_frame(int fd, message_t *msg) {
       ss->header_len = 2;
     } else if (msg->len < 65536) {
       ss->header[1] = 126;
-      ss->header[2] = (msg->len >> 8) & 0xFF;
-      ss->header[3] = msg->len & 0xFF;
+      // Network byte order (big-endian) for 16-bit length
+      uint16_t len16 = htons((uint16_t)msg->len);
+      memcpy(&ss->header[2], &len16, 2);
       ss->header_len = 4;
     } else {
       ss->header[1] = 127;
-      for (int i = 0; i < 8; i++) {
-        ss->header[2 + i] = (msg->len >> (56 - i * 8)) & 0xFF;
-      }
+      uint64_t len64 = (uint64_t)(msg->len);
+      uint32_t high = htonl((uint32_t)(len64 >> 32));
+      uint32_t low = htonl((uint32_t)(len64 & 0xFFFFFFFF));
+      memcpy(&ss->header[2], &high, 4);
+      memcpy(&ss->header[6], &low, 4);
       ss->header_len = 10;
     }
   }
