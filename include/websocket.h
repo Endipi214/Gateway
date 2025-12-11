@@ -37,9 +37,9 @@ void ws_init(void);
 void ws_cleanup(void);
 
 // Returns: message if complete frame received, NULL if incomplete or error
-message_t *parse_ws_frame(int fd);
+message_t *parse_ws_backend_frame(int fd);
 
 // Returns: 0 if complete, 1 if partial (call again), -1 on error
-int send_ws_frame(int fd, message_t *msg);
+int send_ws_backend_frame(int fd, message_t *msg);
 
 #endif // __WEBSOCKET_H__

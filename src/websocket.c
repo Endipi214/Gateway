@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "backend.h"
 #include "gateway.h"
 #include "mempool.h"
 #include "utils.h"
@@ -114,39 +115,34 @@ int handle_ws_handshake(int fd) {
   return 0;
 }
 
-message_t *parse_ws_frame(int fd) {
+message_t *parse_ws_backend_frame(int fd) {
   ws_state_t *st = &ws_states[fd % MAX_CLIENTS];
 
-  // Try to receive data - loop to handle multiple recv calls for fragmented
-  // data
+  // Try to receive data
   while (1) {
     ssize_t n = recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos,
                      MSG_DONTWAIT);
 
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        break; // No more data available right now
+        break;
       }
-      // Real error
-      st->pos = 0; // Reset state on error
+      st->pos = 0;
       return NULL;
     }
 
     if (n == 0) {
-      // Connection closed
-      st->pos = 0; // Reset state
+      st->pos = 0;
       return NULL;
     }
 
     st->pos += n;
 
-    // Try to parse if we might have enough data
     if (st->pos >= 2) {
-      break; // Have at least basic header, try parsing
+      break;
     }
   }
 
-  // Need at least 2 bytes for basic header
   if (st->pos < 2)
     return NULL;
 
@@ -155,16 +151,12 @@ message_t *parse_ws_frame(int fd) {
 
   uint8_t opcode = fin_opcode & 0x0F;
   if (opcode == WS_OPCODE_CLOSE) {
-    st->pos = 0; // Reset state
+    st->pos = 0;
     return NULL;
   }
 
-  // Only handle complete frames (FIN=1)
   if (!(fin_opcode & WS_FIN)) {
-    // Fragmented frame - for now, reset and wait
-    // A full implementation would accumulate fragments
     if (st->pos >= MAX_MESSAGE_SIZE - 1024) {
-      // Buffer nearly full, reset to prevent overflow
       st->pos = 0;
     }
     return NULL;
@@ -177,12 +169,12 @@ message_t *parse_ws_frame(int fd) {
   // Extended payload length
   if (payload_len == 126) {
     if (st->pos < 4)
-      return NULL; // Need more data for extended length
+      return NULL;
     payload_len = (st->buffer[2] << 8) | st->buffer[3];
     header_size = 4;
   } else if (payload_len == 127) {
     if (st->pos < 10)
-      return NULL; // Need more data for extended length
+      return NULL;
     payload_len = 0;
     for (int i = 0; i < 8; i++) {
       payload_len = (payload_len << 8) | st->buffer[2 + i];
@@ -190,68 +182,85 @@ message_t *parse_ws_frame(int fd) {
     header_size = 10;
   }
 
-  // Add mask size if present
   if (masked)
     header_size += 4;
 
   uint32_t frame_size = header_size + payload_len;
 
-  // Validate frame size
   if (frame_size > MAX_MESSAGE_SIZE) {
-    fprintf(stderr, "[WebSocket] Frame too large: %u bytes (max: %u)\n",
-            frame_size, MAX_MESSAGE_SIZE);
-    st->pos = 0; // Reset state
-    return NULL;
-  }
-
-  // Check if we have the complete frame
-  if (st->pos < frame_size) {
-    // Need more data - frame is incomplete
-    // Try to read more immediately if buffer has space
-    if (st->pos < MAX_MESSAGE_SIZE - 1024) {
-      ssize_t n = recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos,
-                       MSG_DONTWAIT);
-      if (n > 0) {
-        st->pos += n;
-        // Check again if frame is complete now
-        if (st->pos < frame_size) {
-          return NULL; // Still incomplete
-        }
-      } else {
-        return NULL; // No more data available
-      }
-    } else {
-      return NULL; // Need more data but buffer getting full
-    }
-  }
-
-  // At this point we have a complete frame
-  // Allocate message
-  message_t *msg = msg_alloc(payload_len);
-  if (!msg) {
-    // Allocation failed, drop frame and reset
-    fprintf(stderr,
-            "[WebSocket] Failed to allocate message for %lu byte payload\n",
-            payload_len);
+    fprintf(stderr, "[WebSocket] Frame too large: %u bytes\n", frame_size);
     st->pos = 0;
     return NULL;
   }
 
-  msg->len = payload_len;
-  msg->timestamp_ns = get_time_ns();
+  if (st->pos < frame_size) {
+    ssize_t n = recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos,
+                     MSG_DONTWAIT);
+    if (n > 0) {
+      st->pos += n;
+      if (st->pos < frame_size) {
+        return NULL;
+      }
+    } else {
+      return NULL;
+    }
+  }
 
-  // Unmask and copy payload
+  // WebSocket payload contains: [12-byte backend header][actual payload]
+
+  if (payload_len < BACKEND_HEADER_SIZE) {
+    fprintf(stderr, "[WebSocket] Payload too small for backend header\n");
+    st->pos = 0;
+    return NULL;
+  }
+
+  // Unmask the entire payload first
+  uint8_t unmasked_payload[MAX_MESSAGE_SIZE];
   if (masked) {
     uint8_t *mask = &st->buffer[header_size - 4];
     uint8_t *payload = &st->buffer[header_size];
     for (uint64_t i = 0; i < payload_len; i++) {
-      msg->data[i] = payload[i] ^ mask[i % 4];
+      unmasked_payload[i] = payload[i] ^ mask[i % 4];
     }
   } else {
-    memcpy(msg->data, &st->buffer[header_size], payload_len);
+    memcpy(unmasked_payload, &st->buffer[header_size], payload_len);
   }
 
-  // Shift remaining data (next frame if any)
+  // Parse backend header from the unmasked payload
+  uint32_t network_len, network_client_id, network_backend_id;
+  memcpy(&network_len, unmasked_payload, 4);
+  memcpy(&network_client_id, unmasked_payload + 4, 4);
+  memcpy(&network_backend_id, unmasked_payload + 8, 4);
+
+  uint32_t backend_payload_len = ntohl(network_len);
+  uint32_t client_id = ntohl(network_client_id);
+  uint32_t backend_id = ntohl(network_backend_id);
+
+  // Validate
+  if (backend_payload_len != payload_len - BACKEND_HEADER_SIZE) {
+    fprintf(stderr, "[WebSocket] Backend header length mismatch\n");
+    st->pos = 0;
+    return NULL;
+  }
+
+  // Allocate message for the actual payload (without backend header)
+  message_t *msg = msg_alloc(backend_payload_len);
+  if (!msg) {
+    fprintf(stderr, "[WebSocket] Failed to allocate message\n");
+    st->pos = 0;
+    return NULL;
+  }
+
+  msg->client_id = client_id;
+  msg->backend_id = backend_id;
+  msg->len = backend_payload_len;
+  msg->timestamp_ns = get_time_ns();
+
+  // Copy actual payload data (skip backend header)
+  memcpy(msg->data, unmasked_payload + BACKEND_HEADER_SIZE,
+         backend_payload_len);
+
+  // Handle remaining data
   if (st->pos > frame_size) {
     uint32_t remaining = st->pos - frame_size;
     memmove(st->buffer, st->buffer + frame_size, remaining);
@@ -263,38 +272,50 @@ message_t *parse_ws_frame(int fd) {
   return msg;
 }
 
-int send_ws_frame(int fd, message_t *msg) {
+int send_ws_backend_frame(int fd, message_t *msg) {
   ws_send_state_t *ss = &ws_send_states[fd % MAX_CLIENTS];
 
   // First call for this message - initialize send state
   if (ss->header_sent == 0 && ss->data_sent == 0) {
-    ss->total_len = msg->len;
-    ss->header_len = 2;
+    // Total length = backend header (12 bytes) + payload
+    ss->total_len = BACKEND_HEADER_SIZE + msg->len;
 
-    // Build header
+    // Build WebSocket header for the total length
     ss->header[0] = WS_FIN | WS_OPCODE_BIN;
 
-    if (msg->len < 126) {
-      ss->header[1] = msg->len;
+    if (ss->total_len < 126) {
+      ss->header[1] = ss->total_len;
       ss->header_len = 2;
-    } else if (msg->len < 65536) {
+    } else if (ss->total_len < 65536) {
       ss->header[1] = 126;
-      // Network byte order (big-endian) for 16-bit length
-      uint16_t len16 = htons((uint16_t)msg->len);
+      uint16_t len16 = htons((uint16_t)ss->total_len);
       memcpy(&ss->header[2], &len16, 2);
       ss->header_len = 4;
     } else {
       ss->header[1] = 127;
-      uint64_t len64 = (uint64_t)(msg->len);
+      uint64_t len64 = (uint64_t)ss->total_len;
       uint32_t high = htonl((uint32_t)(len64 >> 32));
       uint32_t low = htonl((uint32_t)(len64 & 0xFFFFFFFF));
       memcpy(&ss->header[2], &high, 4);
       memcpy(&ss->header[6], &low, 4);
       ss->header_len = 10;
     }
+
+    // Build backend frame header (12 bytes) in a temporary buffer
+    // We'll send: [WS header][backend header][payload]
+    uint32_t network_len = htonl(msg->len);
+    uint32_t network_client_id = htonl(msg->client_id);
+    uint32_t network_backend_id = htonl(msg->backend_id);
+
+    // Store backend header after WebSocket header
+    memcpy(&ss->header[ss->header_len], &network_len, 4);
+    memcpy(&ss->header[ss->header_len + 4], &network_client_id, 4);
+    memcpy(&ss->header[ss->header_len + 8], &network_backend_id, 4);
+
+    ss->header_len += BACKEND_HEADER_SIZE; // Now includes backend header
   }
 
-  // Step 1: Send header if not complete
+  // Step 1: Send WebSocket header + backend header together
   while (ss->header_sent < ss->header_len) {
     ssize_t sent =
         send(fd, ss->header + ss->header_sent, ss->header_len - ss->header_sent,
@@ -314,9 +335,10 @@ int send_ws_frame(int fd, message_t *msg) {
   }
 
   // Step 2: Send payload data
-  while (ss->data_sent < ss->total_len) {
+  uint32_t payload_len = ss->total_len - BACKEND_HEADER_SIZE;
+  while (ss->data_sent < payload_len) {
     ssize_t sent =
-        send(fd, msg->data + ss->data_sent, ss->total_len - ss->data_sent,
+        send(fd, msg->data + ss->data_sent, payload_len - ss->data_sent,
              MSG_DONTWAIT | MSG_NOSIGNAL);
 
     if (sent < 0) {
