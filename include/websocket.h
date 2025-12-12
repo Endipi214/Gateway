@@ -11,7 +11,8 @@ typedef struct {
 
 // ---------- WebSocket Send State ----------
 typedef struct {
-  uint8_t header[14]; // Max header size: 2 + 8 (extended length) + 4 (mask)
+  uint8_t header[26]; // Was 14, now: 2 + 8 (extended length) + 4 (mask) + 12
+                      // (backend header)
   uint32_t header_len;
   uint32_t header_sent;
   uint32_t data_sent;

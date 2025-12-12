@@ -301,21 +301,20 @@ int send_ws_backend_frame(int fd, message_t *msg) {
       ss->header_len = 10;
     }
 
-    // Build backend frame header (12 bytes) in a temporary buffer
-    // We'll send: [WS header][backend header][payload]
+    // Build backend frame header (12 bytes) and append to WebSocket header
     uint32_t network_len = htonl(msg->len);
     uint32_t network_client_id = htonl(msg->client_id);
     uint32_t network_backend_id = htonl(msg->backend_id);
 
-    // Store backend header after WebSocket header
+    // Now we have enough space - append backend header after WebSocket header
     memcpy(&ss->header[ss->header_len], &network_len, 4);
     memcpy(&ss->header[ss->header_len + 4], &network_client_id, 4);
     memcpy(&ss->header[ss->header_len + 8], &network_backend_id, 4);
 
-    ss->header_len += BACKEND_HEADER_SIZE; // Now includes backend header
+    ss->header_len += BACKEND_HEADER_SIZE; // Now includes both headers
   }
 
-  // Step 1: Send WebSocket header + backend header together
+  // Step 1: Send combined WebSocket + backend headers
   while (ss->header_sent < ss->header_len) {
     ssize_t sent =
         send(fd, ss->header + ss->header_sent, ss->header_len - ss->header_sent,
@@ -334,12 +333,11 @@ int send_ws_backend_frame(int fd, message_t *msg) {
     ss->header_sent += sent;
   }
 
-  // Step 2: Send payload data
-  uint32_t payload_len = ss->total_len - BACKEND_HEADER_SIZE;
-  while (ss->data_sent < payload_len) {
-    ssize_t sent =
-        send(fd, msg->data + ss->data_sent, payload_len - ss->data_sent,
-             MSG_DONTWAIT | MSG_NOSIGNAL);
+  // Step 2: Send payload data (msg->len bytes, NOT ss->total_len -
+  // BACKEND_HEADER_SIZE)
+  while (ss->data_sent < msg->len) {
+    ssize_t sent = send(fd, msg->data + ss->data_sent, msg->len - ss->data_sent,
+                        MSG_DONTWAIT | MSG_NOSIGNAL);
 
     if (sent < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
