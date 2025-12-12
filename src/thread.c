@@ -67,20 +67,36 @@ void *ws_thread_fn(void *arg) {
         int broadcast_count = 0;
         pthread_mutex_lock(&clients_lock);
 
+        // DEBUG: Count total clients
+        int total_clients = 0;
+        int active_clients = 0;
         for (int i = 1; i < MAX_CLIENTS; i++) {
-          if (clients[i].fd == i && clients[i].state == CLIENT_STATE_ACTIVE) {
+          if (clients[i].fd > 0) {
+            total_clients++;
+            if (clients[i].state == CLIENT_STATE_ACTIVE) {
+              active_clients++;
+            }
+          }
+        }
+        printf("[WS] DEBUG: Found %d total clients, %d active clients\n",
+               total_clients, active_clients);
+
+        for (int i = 1; i < MAX_CLIENTS; i++) {
+          if (clients[i].fd > 0 && clients[i].state == CLIENT_STATE_ACTIVE) {
             message_t *broadcast_msg = msg_alloc(msg->len);
             if (broadcast_msg) {
-              broadcast_msg->client_id = i;
+              broadcast_msg->client_id = clients[i].fd;
               broadcast_msg->backend_id = msg->backend_id;
               broadcast_msg->len = msg->len;
               broadcast_msg->timestamp_ns = msg->timestamp_ns;
               memcpy(broadcast_msg->data, msg->data, msg->len);
 
-              int client_idx = i % MAX_CLIENTS;
+              int client_fd = clients[i].fd;
+              int client_idx = client_fd % MAX_CLIENTS;
 
               if (ws_pending_sends[client_idx].in_progress) {
-                fprintf(stderr, "[WS] Client fd=%d busy, dropping\n", i);
+                fprintf(stderr, "[WS] Client fd=%d busy, dropping\n",
+                        client_fd);
                 msg_free(broadcast_msg);
                 continue;
               }
@@ -89,7 +105,7 @@ void *ws_thread_fn(void *arg) {
               ws_pending_sends[client_idx].in_progress = 1;
 
               // USE NEW FUNCTION - sends backend frame format
-              int result = send_ws_backend_frame(i, broadcast_msg);
+              int result = send_ws_backend_frame(client_fd, broadcast_msg);
 
               if (result == 0) {
                 uint64_t latency = get_time_ns() - broadcast_msg->timestamp_ns;
@@ -104,8 +120,8 @@ void *ws_thread_fn(void *arg) {
                 broadcast_count++;
               } else if (result == 1) {
                 ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                ev.data.fd = i;
-                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, i, &ev);
+                ev.data.fd = client_fd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev);
                 broadcast_count++;
               } else {
                 msg_free(broadcast_msg);
@@ -270,6 +286,42 @@ void *ws_thread_fn(void *arg) {
         if (handle_ws_handshake(fd) == 0) {
           clients[fd].state = CLIENT_STATE_ACTIVE;
           printf("[WS] Handshake complete for client_id=%d\n", fd);
+
+          // Send the client its assigned ID
+          // Message format: client_id=<assigned_id>, backend_id=0 (from
+          // gateway), payload="WELCOME"
+          message_t *welcome_msg = msg_alloc(0);
+          if (welcome_msg) {
+            welcome_msg->client_id = fd;
+            welcome_msg->backend_id = 0; // 0 means from gateway itself
+            welcome_msg->len = 0; // Empty payload or you could send "WELCOME"
+            welcome_msg->timestamp_ns = get_time_ns();
+
+            int client_idx = fd % MAX_CLIENTS;
+            if (!ws_pending_sends[client_idx].in_progress) {
+              ws_pending_sends[client_idx].msg = welcome_msg;
+              ws_pending_sends[client_idx].in_progress = 1;
+
+              int result = send_ws_backend_frame(fd, welcome_msg);
+              if (result == 0) {
+                printf("[WS] Sent ID assignment to client_id=%d\n", fd);
+                msg_free(welcome_msg);
+                ws_pending_sends[client_idx].in_progress = 0;
+                ws_pending_sends[client_idx].msg = NULL;
+              } else if (result == 1) {
+                // Partial send - will complete with EPOLLOUT
+                ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+                ev.data.fd = fd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+              } else {
+                msg_free(welcome_msg);
+                ws_pending_sends[client_idx].in_progress = 0;
+                ws_pending_sends[client_idx].msg = NULL;
+              }
+            } else {
+              msg_free(welcome_msg);
+            }
+          }
         } else {
           printf("[WS] Handshake failed for client_id=%d\n", fd);
           epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
@@ -298,8 +350,12 @@ void *ws_thread_fn(void *arg) {
         continue;
       }
 
+      // IMPORTANT: Override client_id with the actual sender's fd
+      // The client cannot choose its own ID - the gateway assigns it
+      msg->client_id = fd;
+
       // Client now sends messages in backend format!
-      // msg->client_id and msg->backend_id are already parsed
+      // msg->backend_id is from the client's message (tells us where to route)
 
       atomic_fetch_add(&metrics_ws.messages_recv, 1);
       atomic_fetch_add(&metrics_ws.bytes_recv, BACKEND_HEADER_SIZE + msg->len);
@@ -310,7 +366,7 @@ void *ws_thread_fn(void *arg) {
       // Route to backend(s)
       if (msg->backend_id == 0) {
         // Broadcast to all backends
-        int broadcast_count = 0;
+        int backend_broadcast_count = 0;
         for (int j = 0; j < backend_server_count; j++) {
           if (atomic_load(&backends[j].connected)) {
             message_t *broadcast_msg = msg_alloc(msg->len);
@@ -322,7 +378,7 @@ void *ws_thread_fn(void *arg) {
               memcpy(broadcast_msg->data, msg->data, msg->len);
 
               if (queue_push(&q_ws_to_backend, broadcast_msg)) {
-                broadcast_count++;
+                backend_broadcast_count++;
               } else {
                 msg_free(broadcast_msg);
               }
@@ -330,11 +386,64 @@ void *ws_thread_fn(void *arg) {
           }
         }
 
-        if (broadcast_count > 0) {
+        if (backend_broadcast_count > 0) {
           signal_eventfd(eventfd_backend);
           printf("[WS] Broadcast client_id=%u → %d backends\n", msg->client_id,
-                 broadcast_count);
+                 backend_broadcast_count);
         }
+
+        // NEW: Also broadcast to all clients
+        int client_broadcast_count = 0;
+        pthread_mutex_lock(&clients_lock);
+        for (int j = 1; j < MAX_CLIENTS; j++) {
+          if (clients[j].fd > 0 && clients[j].state == CLIENT_STATE_ACTIVE) {
+            message_t *client_msg = msg_alloc(msg->len);
+            if (client_msg) {
+              client_msg->client_id = clients[j].fd;
+              client_msg->backend_id = msg->backend_id;
+              client_msg->len = msg->len;
+              client_msg->timestamp_ns = msg->timestamp_ns;
+              memcpy(client_msg->data, msg->data, msg->len);
+
+              int client_fd = clients[j].fd;
+              int client_idx = client_fd % MAX_CLIENTS;
+              if (!ws_pending_sends[client_idx].in_progress) {
+                ws_pending_sends[client_idx].msg = client_msg;
+                ws_pending_sends[client_idx].in_progress = 1;
+
+                int result = send_ws_backend_frame(client_fd, client_msg);
+                if (result == 0) {
+                  atomic_fetch_add(&metrics_ws.messages_sent, 1);
+                  atomic_fetch_add(&metrics_ws.bytes_sent,
+                                   BACKEND_HEADER_SIZE + client_msg->len);
+                  msg_free(client_msg);
+                  ws_pending_sends[client_idx].in_progress = 0;
+                  ws_pending_sends[client_idx].msg = NULL;
+                  client_broadcast_count++;
+                } else if (result == 1) {
+                  ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+                  ev.data.fd = client_fd;
+                  epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev);
+                  client_broadcast_count++;
+                } else {
+                  msg_free(client_msg);
+                  ws_pending_sends[client_idx].in_progress = 0;
+                  ws_pending_sends[client_idx].msg = NULL;
+                }
+              } else {
+                msg_free(client_msg);
+              }
+            }
+          }
+        }
+        pthread_mutex_unlock(&clients_lock);
+
+        if (client_broadcast_count > 0) {
+          printf("[WS] Also broadcast to %d clients\n", client_broadcast_count);
+        }
+
+        msg_free(msg);
+        continue;
       } else {
         // Unicast to specific backend
         int backend_slot = msg->backend_id - 1;
