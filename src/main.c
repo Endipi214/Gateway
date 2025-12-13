@@ -34,6 +34,7 @@ int ws_port;
 backend_server_t backend_servers[MAX_BACKEND_SERVERS];
 int backend_server_count = 0;
 backend_conn_t backends[MAX_BACKEND_SERVERS];
+pthread_mutex_t ws_send_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Signal handling
 void signal_handler(int sig) {

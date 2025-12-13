@@ -1,6 +1,7 @@
 #ifndef __GATEWAY_H__
 #define __GATEWAY_H__
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <time.h>
@@ -20,6 +21,7 @@
 extern int eventfd_ws;
 extern int eventfd_backend;
 extern atomic_bool running;
+extern pthread_mutex_t ws_send_lock;
 
 // --------- Client Connection ---------
 typedef struct {

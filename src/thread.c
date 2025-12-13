@@ -479,17 +479,20 @@ void *backend_thread_fn(void *arg) {
     return NULL;
   }
 
-  // Add eventfd
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.fd = eventfd_backend;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventfd_backend, &ev);
 
-  printf("[Backend Thread] Started, connecting to %d backend servers\n",
-         backend_server_count);
+  printf("[Backend Thread] Started with DIRECT FORWARDING optimization\n");
+  printf("[Backend Thread] Unicast messages bypass queue for lower latency\n");
 
   struct epoll_event events[EPOLL_EVENTS];
   time_t last_reconnect = 0;
+
+  // Statistics
+  uint64_t direct_sends = 0;
+  uint64_t queued_sends = 0;
 
   while (atomic_load_explicit(&running, memory_order_acquire)) {
     // Attempt to connect/reconnect backends
@@ -507,7 +510,6 @@ void *backend_thread_fn(void *arg) {
                                   memory_order_release);
             backends[i].reconnect_count++;
 
-            // Initialize send state
             backend_pending_sends[fd % MAX_BACKENDS].in_progress = 0;
             backend_pending_sends[fd % MAX_BACKENDS].msg = NULL;
 
@@ -519,19 +521,16 @@ void *backend_thread_fn(void *arg) {
                                       memory_order_relaxed);
             printf("[Backend] Connected to %s:%d (fd=%d, backend_id=%d)\n",
                    backend_servers[i].host, backend_servers[i].port, fd, i + 1);
-          } else {
-            printf("[Backend] Failed to connect to %s:%d (backend_id=%d)\n",
-                   backend_servers[i].host, backend_servers[i].port, i + 1);
           }
         }
       }
       last_reconnect = now;
     }
 
-    // Process outgoing messages from queue
+    // Process outgoing messages from queue (WS → Backend)
     message_t *msg;
     while ((msg = queue_pop(&q_ws_to_backend)) != NULL) {
-      int backend_slot = msg->backend_id - 1; // Convert to 0-based slot
+      int backend_slot = msg->backend_id - 1;
 
       if (backend_slot < 0 || backend_slot >= backend_server_count) {
         fprintf(stderr, "[Backend] Invalid backend_id=%u, dropping message\n",
@@ -552,7 +551,6 @@ void *backend_thread_fn(void *arg) {
       int backend_fd = backends[backend_slot].fd;
       int backend_idx = backend_fd % MAX_BACKENDS;
 
-      // Check if there's already a pending send
       if (backend_pending_sends[backend_idx].in_progress) {
         fprintf(stderr,
                 "[Backend] Backend_id=%u has pending send, dropping message\n",
@@ -561,7 +559,6 @@ void *backend_thread_fn(void *arg) {
         continue;
       }
 
-      // Start sending
       backend_pending_sends[backend_idx].msg = msg;
       backend_pending_sends[backend_idx].client_id = msg->client_id;
       backend_pending_sends[backend_idx].backend_id = msg->backend_id;
@@ -571,26 +568,18 @@ void *backend_thread_fn(void *arg) {
           write_backend_frame(backend_fd, msg, msg->client_id, msg->backend_id);
 
       if (result == 0) {
-        // Complete send
         atomic_fetch_add_explicit(&metrics_backend.messages_sent, 1,
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&metrics_backend.bytes_sent, msg->len,
                                   memory_order_relaxed);
-        printf("[Backend] Sent %u bytes from client_id=%u to backend_id=%u\n",
-               msg->len, msg->client_id, msg->backend_id);
         msg_free(msg);
         backend_pending_sends[backend_idx].in_progress = 0;
         backend_pending_sends[backend_idx].msg = NULL;
       } else if (result == 1) {
-        // Partial send - add EPOLLOUT
-        printf(
-            "[Backend] Partial send to backend_id=%u, waiting for EPOLLOUT\n",
-            msg->backend_id);
         ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
         ev.data.fd = backend_fd;
         epoll_ctl(epoll_fd, EPOLL_CTL_MOD, backend_fd, &ev);
       } else {
-        // Error - cleanup
         fprintf(stderr, "[Backend] Error sending to backend_id=%u\n",
                 msg->backend_id);
         msg_free(msg);
@@ -609,7 +598,6 @@ void *backend_thread_fn(void *arg) {
         continue;
       }
 
-      // Handle EPOLLOUT - continue pending send
       if (events[i].events & EPOLLOUT) {
         int backend_idx = fd % MAX_BACKENDS;
         if (backend_pending_sends[backend_idx].in_progress) {
@@ -621,24 +609,18 @@ void *backend_thread_fn(void *arg) {
               write_backend_frame(fd, pending_msg, client_id, backend_id);
 
           if (result == 0) {
-            // Complete send
             atomic_fetch_add_explicit(&metrics_backend.messages_sent, 1,
                                       memory_order_relaxed);
             atomic_fetch_add_explicit(&metrics_backend.bytes_sent,
                                       pending_msg->len, memory_order_relaxed);
-            printf("[Backend] Completed partial send: %u bytes from "
-                   "client_id=%u to backend_id=%u\n",
-                   pending_msg->len, client_id, backend_id);
             msg_free(pending_msg);
             backend_pending_sends[backend_idx].in_progress = 0;
             backend_pending_sends[backend_idx].msg = NULL;
 
-            // Remove EPOLLOUT
             ev.events = EPOLLIN | EPOLLET;
             ev.data.fd = fd;
             epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
           } else if (result == -1) {
-            // Error - cleanup
             fprintf(stderr, "[Backend] Error completing send to fd=%d\n", fd);
             msg_free(pending_msg);
             backend_pending_sends[backend_idx].in_progress = 0;
@@ -647,7 +629,6 @@ void *backend_thread_fn(void *arg) {
         }
       }
 
-      // Handle EPOLLIN
       if (!(events[i].events & EPOLLIN)) {
         continue;
       }
@@ -656,7 +637,6 @@ void *backend_thread_fn(void *arg) {
       message_t *msg = read_backend_frame(fd);
       if (!msg) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-          // Find which backend slot disconnected
           for (int j = 0; j < backend_server_count; j++) {
             if (backends[j].fd == fd) {
               epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
@@ -670,7 +650,6 @@ void *backend_thread_fn(void *arg) {
                   "[Backend] Disconnected from %s:%d (fd=%d, backend_id=%d)\n",
                   backend_servers[j].host, backend_servers[j].port, fd, j + 1);
 
-              // Cleanup any pending send
               int backend_idx = fd % MAX_BACKENDS;
               if (backend_pending_sends[backend_idx].in_progress) {
                 msg_free(backend_pending_sends[backend_idx].msg);
@@ -701,7 +680,6 @@ void *backend_thread_fn(void *arg) {
         continue;
       }
 
-      // Set backend_id to the 1-based slot
       msg->backend_id = backend_slot + 1;
 
       atomic_fetch_add_explicit(&metrics_backend.messages_recv, 1,
@@ -709,22 +687,79 @@ void *backend_thread_fn(void *arg) {
       atomic_fetch_add_explicit(&metrics_backend.bytes_recv, msg->len,
                                 memory_order_relaxed);
 
-      printf("[Backend] Received %u bytes from backend_id=%u targeting "
-             "client_id=%u\n",
-             msg->len, msg->backend_id, msg->client_id);
+      // OPTIMIZATION: Direct forwarding for unicast
+      if (msg->client_id != 0) {
+        // UNICAST: Send directly without queue
+        int client_fd = msg->client_id;
 
-      if (!queue_push(&q_backend_to_ws, msg)) {
-        fprintf(stderr,
-                "[Backend] Queue full, dropping message from backend_id=%u\n",
-                msg->backend_id);
-        msg_free(msg);
+        pthread_mutex_lock(&clients_lock);
+        int client_valid = (client_fd > 0 && client_fd < MAX_CLIENTS &&
+                            clients[client_fd].fd == client_fd &&
+                            clients[client_fd].state == CLIENT_STATE_ACTIVE);
+        pthread_mutex_unlock(&clients_lock);
+
+        if (!client_valid) {
+          fprintf(stderr,
+                  "[Backend] DIRECT: Client id=%u not active, dropping\n",
+                  msg->client_id);
+          msg_free(msg);
+          continue;
+        }
+
+        // Try direct send (protected by mutex since WS thread might also send)
+        pthread_mutex_lock(&ws_send_lock);
+        int result = send_ws_backend_frame(client_fd, msg);
+        pthread_mutex_unlock(&ws_send_lock);
+
+        if (result == 0) {
+          // Success
+          uint64_t latency = get_time_ns() - msg->timestamp_ns;
+          atomic_fetch_add(&metrics_ws.messages_sent, 1);
+          atomic_fetch_add(&metrics_ws.bytes_sent,
+                           BACKEND_HEADER_SIZE + msg->len);
+          atomic_fetch_add(&metrics_ws.latency_sum_ns, latency);
+          atomic_fetch_add(&metrics_ws.latency_count, 1);
+
+          direct_sends++;
+          if (direct_sends % 100 == 0) {
+            printf(
+                "[Backend] DIRECT: Sent %lu messages (avg latency: %.2f µs)\n",
+                direct_sends, latency / 1000.0);
+          }
+
+          msg_free(msg);
+        } else {
+          // Partial send or error - fall back to queue
+          if (!queue_push(&q_backend_to_ws, msg)) {
+            fprintf(stderr, "[Backend] DIRECT failed, queue full, dropping\n");
+            msg_free(msg);
+          } else {
+            signal_eventfd(eventfd_ws);
+            queued_sends++;
+          }
+        }
+
       } else {
-        signal_eventfd(eventfd_ws);
+        // BROADCAST: Use queue as before
+        if (!queue_push(&q_backend_to_ws, msg)) {
+          fprintf(
+              stderr,
+              "[Backend] Queue full, dropping broadcast from backend_id=%u\n",
+              msg->backend_id);
+          msg_free(msg);
+        } else {
+          signal_eventfd(eventfd_ws);
+          queued_sends++;
+        }
       }
     }
   }
 
-  // Cleanup backend connections
+  // Cleanup
+  printf("[Backend Thread] Statistics:\n");
+  printf("  Direct sends: %lu (bypassed queue)\n", direct_sends);
+  printf("  Queued sends: %lu (broadcasts or partial sends)\n", queued_sends);
+
   for (int i = 0; i < backend_server_count; i++) {
     if (backends[i].fd >= 0) {
       close(backends[i].fd);
