@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -18,22 +19,370 @@
 
 pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// Helper structure to track pending sends for WebSocket
-typedef struct {
-  message_t *msg;
-  int in_progress;
-} ws_pending_send_t;
+// Message queue entry
+typedef struct message_entry {
+  uint32_t ctx_id;
+  chunk_t **chunks;
+  uint32_t chunk_count;
+  uint32_t total_chunks;
+  uint32_t next_send_index;
+  int complete;
+  struct message_entry *next;
+} message_entry_t;
 
-// Helper structure to track pending sends for Backend
+// Per-connection message buffer with queue support
 typedef struct {
-  message_t *msg;
-  uint32_t client_id;
-  uint32_t backend_id;
-  int in_progress;
-} backend_pending_send_t;
+  message_entry_t *head;    // First message in queue
+  message_entry_t *tail;    // Last message in queue
+  message_entry_t *sending; // Currently sending message
+  uint32_t queue_size;      // Number of messages queued
+  uint32_t max_queue_size;  // Maximum queue size
+} message_buffer_t;
 
-static ws_pending_send_t ws_pending_sends[MAX_CLIENTS] = {0};
-static backend_pending_send_t backend_pending_sends[MAX_BACKENDS] = {0};
+static message_buffer_t *ws_msg_buffers = NULL;
+static message_buffer_t *backend_msg_buffers = NULL;
+
+// Initialize message buffer
+static void init_message_buffer(message_buffer_t *buf, uint32_t max_queue) {
+  buf->head = NULL;
+  buf->tail = NULL;
+  buf->sending = NULL;
+  buf->queue_size = 0;
+  buf->max_queue_size = max_queue;
+}
+
+// Free a message entry
+static void free_message_entry(message_entry_t *entry) {
+  if (!entry)
+    return;
+
+  if (entry->chunks) {
+    for (uint32_t i = 0; i < entry->chunk_count; i++) {
+      if (entry->chunks[i]) {
+        msg_context_unref(entry->chunks[i]->ctx);
+        chunk_free(entry->chunks[i]);
+      }
+    }
+    free(entry->chunks);
+  }
+  free(entry);
+}
+
+// Free message buffer
+static void free_message_buffer(message_buffer_t *buf) {
+  message_entry_t *entry = buf->head;
+  while (entry) {
+    message_entry_t *next = entry->next;
+    free_message_entry(entry);
+    entry = next;
+  }
+
+  if (buf->sending && buf->sending != buf->head) {
+    free_message_entry(buf->sending);
+  }
+
+  buf->head = NULL;
+  buf->tail = NULL;
+  buf->sending = NULL;
+  buf->queue_size = 0;
+}
+
+// Find or create message entry for a chunk
+static message_entry_t *find_or_create_message(message_buffer_t *buf,
+                                               chunk_t *chunk) {
+  // Check if message already exists in queue
+  message_entry_t *entry = buf->head;
+  while (entry) {
+    if (entry->ctx_id == chunk->ctx->ctx_id) {
+      return entry;
+    }
+    entry = entry->next;
+  }
+
+  // Check queue size limit
+  if (buf->queue_size >= buf->max_queue_size) {
+    fprintf(stderr, "[Buffer] Queue full, cannot create new message\n");
+    return NULL;
+  }
+
+  // Create new entry
+  entry = calloc(1, sizeof(message_entry_t));
+  if (!entry)
+    return NULL;
+
+  entry->ctx_id = chunk->ctx->ctx_id;
+  entry->total_chunks = chunk->ctx->total_chunks;
+  entry->chunks = calloc(entry->total_chunks, sizeof(chunk_t *));
+  if (!entry->chunks) {
+    free(entry);
+    return NULL;
+  }
+  entry->chunk_count = 0;
+  entry->next_send_index = 0;
+  entry->complete = 0;
+  entry->next = NULL;
+
+  // Add to queue
+  if (buf->tail) {
+    buf->tail->next = entry;
+    buf->tail = entry;
+  } else {
+    buf->head = buf->tail = entry;
+  }
+  buf->queue_size++;
+
+  return entry;
+}
+
+// Add chunk to buffer (returns 1 on success, 0 if full)
+static int buffer_add_chunk(message_buffer_t *buf, chunk_t *chunk) {
+  message_entry_t *entry = find_or_create_message(buf, chunk);
+  if (!entry)
+    return 0;
+
+  // Check if chunk already exists (duplicate)
+  if (chunk->chunk_index < entry->total_chunks &&
+      entry->chunks[chunk->chunk_index] != NULL) {
+    return 1; // Already have this chunk, silently ignore
+  }
+
+  // Store chunk in its position
+  if (chunk->chunk_index < entry->total_chunks) {
+    entry->chunks[chunk->chunk_index] = chunk;
+    entry->chunk_count++;
+
+    // Check if message is complete
+    if (entry->chunk_count >= entry->total_chunks) {
+      entry->complete = 1;
+    }
+  }
+
+  return 1;
+}
+
+// Get next chunk to send (in order)
+static chunk_t *buffer_get_next_chunk(message_buffer_t *buf) {
+  if (!buf->sending) {
+    // Start sending first complete message
+    message_entry_t *entry = buf->head;
+    while (entry) {
+      if (entry->complete) {
+        buf->sending = entry;
+        break;
+      }
+      entry = entry->next;
+    }
+
+    if (!buf->sending)
+      return NULL; // No complete messages
+  }
+
+  message_entry_t *sending = buf->sending;
+
+  // Get next chunk in sequence
+  if (sending->next_send_index >= sending->total_chunks) {
+    // Message complete, remove from queue
+    if (buf->head == sending) {
+      buf->head = sending->next;
+      if (!buf->head)
+        buf->tail = NULL;
+    } else {
+      // Find previous entry
+      message_entry_t *prev = buf->head;
+      while (prev && prev->next != sending) {
+        prev = prev->next;
+      }
+      if (prev) {
+        prev->next = sending->next;
+        if (buf->tail == sending)
+          buf->tail = prev;
+      }
+    }
+
+    buf->queue_size--;
+    free_message_entry(sending);
+    buf->sending = NULL;
+
+    // Try next message
+    return buffer_get_next_chunk(buf);
+  }
+
+  chunk_t *chunk = sending->chunks[sending->next_send_index];
+  if (!chunk) {
+    // Chunk missing? Should not happen if complete
+    fprintf(stderr, "[Buffer] Missing chunk %u in complete message\n",
+            sending->next_send_index);
+    return NULL;
+  }
+
+  sending->chunks[sending->next_send_index] = NULL; // Remove reference
+  sending->next_send_index++;
+
+  return chunk;
+}
+
+// Try to send chunks from buffer
+static void try_send_buffered_chunks(int fd, int epoll_fd,
+                                     message_buffer_t *buf,
+                                     int (*send_func)(int, chunk_t *),
+                                     metrics_t *metrics, int is_ws) {
+  struct epoll_event ev;
+
+  // For WebSocket: Only send complete messages
+  if (is_ws) {
+    // Check if we have at least one complete message
+    int has_complete = 0;
+    message_entry_t *entry = buf->head;
+    while (entry) {
+      if (entry->complete) {
+        has_complete = 1;
+        break;
+      }
+      entry = entry->next;
+    }
+    if (!has_complete)
+      return;
+  }
+
+  // Keep sending chunks while available
+  while (1) {
+    chunk_t *chunk = buffer_get_next_chunk(buf);
+    if (!chunk)
+      break;
+
+    int result = send_func(fd, chunk);
+
+    if (result == 0) {
+      // Complete send
+      atomic_fetch_add(&metrics->messages_sent, 1);
+      atomic_fetch_add(&metrics->bytes_sent, chunk->len);
+
+      if (is_ws) {
+        printf("[WS] Sent chunk %u/%u → client_id=%u (%u bytes)\n",
+               chunk->chunk_index + 1, chunk->ctx->total_chunks,
+               chunk->ctx->client_id, chunk->len);
+      } else {
+        printf("[Backend] Sent chunk %u/%u → backend_id=%u (%u bytes)\n",
+               chunk->chunk_index + 1, chunk->ctx->total_chunks,
+               chunk->ctx->backend_id, chunk->len);
+      }
+
+      msg_context_unref(chunk->ctx);
+      chunk_free(chunk);
+
+    } else if (result == 1) {
+      // Partial send - need to retry this chunk
+      // Put chunk back at current position
+      if (buf->sending) {
+        if (buf->sending->next_send_index > 0) {
+          buf->sending->next_send_index--;
+          buf->sending->chunks[buf->sending->next_send_index] = chunk;
+        }
+      }
+
+      // Enable EPOLLOUT
+      ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+      ev.data.fd = fd;
+      epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+      break;
+
+    } else {
+      // Error
+      fprintf(stderr, "[Send] Error sending chunk to fd=%d\n", fd);
+      msg_context_unref(chunk->ctx);
+      chunk_free(chunk);
+      break;
+    }
+  }
+}
+
+static void drain_backend_to_ws_queue(int epoll_fd) {
+  chunk_t *chunk;
+
+  while ((chunk = queue_pop(&q_backend_to_ws)) != NULL) {
+    if (!chunk->ctx) {
+      fprintf(stderr, "[WS] Chunk missing context, dropping\n");
+      chunk_free(chunk);
+      continue;
+    }
+
+    uint32_t target_client_id = chunk->ctx->client_id;
+
+    // Broadcast to all clients
+    if (target_client_id == 0) {
+      int broadcast_count = 0;
+      pthread_mutex_lock(&clients_lock);
+
+      for (int i = 1; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd > 0 && clients[i].state == CLIENT_STATE_ACTIVE) {
+          chunk_t *bc = chunk_alloc(chunk->len);
+          if (bc) {
+            bc->ctx = chunk->ctx;
+            msg_context_ref(chunk->ctx);
+            bc->chunk_index = chunk->chunk_index;
+            bc->len = chunk->len;
+            bc->is_first_chunk = chunk->is_first_chunk;
+            memcpy(bc->data, chunk->data, chunk->len);
+
+            int client_fd = clients[i].fd;
+            message_buffer_t *buf = &ws_msg_buffers[client_fd % MAX_CLIENTS];
+
+            if (buffer_add_chunk(buf, bc)) {
+              try_send_buffered_chunks(client_fd, epoll_fd, buf, send_ws_chunk,
+                                       &metrics_ws, 1);
+              broadcast_count++;
+            } else {
+              msg_context_unref(bc->ctx);
+              chunk_free(bc);
+            }
+          }
+        }
+      }
+      pthread_mutex_unlock(&clients_lock);
+
+      printf("[WS] Broadcast chunk %u/%u → %d clients (%u bytes)\n",
+             chunk->chunk_index + 1, chunk->ctx->total_chunks, broadcast_count,
+             chunk->len);
+      msg_context_unref(chunk->ctx);
+      chunk_free(chunk);
+      continue;
+    }
+
+    // Unicast to specific client
+    int client_fd = target_client_id;
+
+    if (client_fd <= 0 || client_fd >= MAX_CLIENTS) {
+      fprintf(stderr, "[WS] Invalid client_id=%u\n", target_client_id);
+      msg_context_unref(chunk->ctx);
+      chunk_free(chunk);
+      continue;
+    }
+
+    pthread_mutex_lock(&clients_lock);
+    int client_valid = (clients[client_fd].fd == client_fd &&
+                        clients[client_fd].state == CLIENT_STATE_ACTIVE);
+    pthread_mutex_unlock(&clients_lock);
+
+    if (!client_valid) {
+      fprintf(stderr, "[WS] Client id=%u not active\n", target_client_id);
+      msg_context_unref(chunk->ctx);
+      chunk_free(chunk);
+      continue;
+    }
+
+    message_buffer_t *buf = &ws_msg_buffers[client_fd % MAX_CLIENTS];
+
+    if (buffer_add_chunk(buf, chunk)) {
+      try_send_buffered_chunks(client_fd, epoll_fd, buf, send_ws_chunk,
+                               &metrics_ws, 1);
+    } else {
+      fprintf(stderr, "[WS] Buffer full for client_id=%u, dropping chunk\n",
+              target_client_id);
+      msg_context_unref(chunk->ctx);
+      chunk_free(chunk);
+    }
+  }
+}
 
 void *ws_thread_fn(void *arg) {
   int listen_fd = *(int *)arg;
@@ -41,6 +390,13 @@ void *ws_thread_fn(void *arg) {
   if (epoll_fd < 0) {
     perror("epoll_create1");
     return NULL;
+  }
+
+  // Initialize message buffers
+  ws_msg_buffers = calloc(MAX_CLIENTS, sizeof(message_buffer_t));
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    init_message_buffer(&ws_msg_buffers[i],
+                        32); // Queue up to 32 concurrent messages per client
   }
 
   struct epoll_event ev;
@@ -52,151 +408,13 @@ void *ws_thread_fn(void *arg) {
   ev.data.fd = eventfd_ws;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventfd_ws, &ev);
 
-  printf("[WS Thread] Started - forwarding full backend frames\n");
+  printf(
+      "[WS Thread] Started - chunked operation mode with message buffering\n");
 
   struct epoll_event events[EPOLL_EVENTS];
 
   while (atomic_load_explicit(&running, memory_order_acquire)) {
-    // Process outgoing messages from queue
-    message_t *msg;
-    while ((msg = queue_pop(&q_backend_to_ws)) != NULL) {
-      uint32_t target_client_id = msg->client_id;
-
-      // Broadcast to all clients
-      if (target_client_id == 0) {
-        int broadcast_count = 0;
-        pthread_mutex_lock(&clients_lock);
-
-        // DEBUG: Count total clients
-        int total_clients = 0;
-        int active_clients = 0;
-        for (int i = 1; i < MAX_CLIENTS; i++) {
-          if (clients[i].fd > 0) {
-            total_clients++;
-            if (clients[i].state == CLIENT_STATE_ACTIVE) {
-              active_clients++;
-            }
-          }
-        }
-        printf("[WS] DEBUG: Found %d total clients, %d active clients\n",
-               total_clients, active_clients);
-
-        for (int i = 1; i < MAX_CLIENTS; i++) {
-          if (clients[i].fd > 0 && clients[i].state == CLIENT_STATE_ACTIVE) {
-            message_t *broadcast_msg = msg_alloc(msg->len);
-            if (broadcast_msg) {
-              broadcast_msg->client_id = clients[i].fd;
-              broadcast_msg->backend_id = msg->backend_id;
-              broadcast_msg->len = msg->len;
-              broadcast_msg->timestamp_ns = msg->timestamp_ns;
-              memcpy(broadcast_msg->data, msg->data, msg->len);
-
-              int client_fd = clients[i].fd;
-              int client_idx = client_fd % MAX_CLIENTS;
-
-              if (ws_pending_sends[client_idx].in_progress) {
-                fprintf(stderr, "[WS] Client fd=%d busy, dropping\n",
-                        client_fd);
-                msg_free(broadcast_msg);
-                continue;
-              }
-
-              ws_pending_sends[client_idx].msg = broadcast_msg;
-              ws_pending_sends[client_idx].in_progress = 1;
-
-              // USE NEW FUNCTION - sends backend frame format
-              int result = send_ws_backend_frame(client_fd, broadcast_msg);
-
-              if (result == 0) {
-                uint64_t latency = get_time_ns() - broadcast_msg->timestamp_ns;
-                atomic_fetch_add(&metrics_ws.messages_sent, 1);
-                atomic_fetch_add(&metrics_ws.bytes_sent,
-                                 BACKEND_HEADER_SIZE + broadcast_msg->len);
-                atomic_fetch_add(&metrics_ws.latency_sum_ns, latency);
-                atomic_fetch_add(&metrics_ws.latency_count, 1);
-                msg_free(broadcast_msg);
-                ws_pending_sends[client_idx].in_progress = 0;
-                ws_pending_sends[client_idx].msg = NULL;
-                broadcast_count++;
-              } else if (result == 1) {
-                ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                ev.data.fd = client_fd;
-                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev);
-                broadcast_count++;
-              } else {
-                msg_free(broadcast_msg);
-                ws_pending_sends[client_idx].in_progress = 0;
-                ws_pending_sends[client_idx].msg = NULL;
-              }
-            }
-          }
-        }
-        pthread_mutex_unlock(&clients_lock);
-
-        printf("[WS] Broadcast backend_id=%u → %d clients (%u+12 bytes)\n",
-               msg->backend_id, broadcast_count, msg->len);
-        msg_free(msg);
-        continue;
-      }
-
-      // Unicast to specific client
-      int client_fd = target_client_id;
-      int client_idx = client_fd % MAX_CLIENTS;
-
-      if (client_fd <= 0 || client_fd >= MAX_CLIENTS) {
-        fprintf(stderr, "[WS] Invalid client_id=%u\n", target_client_id);
-        msg_free(msg);
-        continue;
-      }
-
-      pthread_mutex_lock(&clients_lock);
-      int client_valid = (clients[client_fd].fd == client_fd &&
-                          clients[client_fd].state == CLIENT_STATE_ACTIVE);
-      pthread_mutex_unlock(&clients_lock);
-
-      if (!client_valid) {
-        fprintf(stderr, "[WS] Client id=%u not active\n", target_client_id);
-        msg_free(msg);
-        continue;
-      }
-
-      if (ws_pending_sends[client_idx].in_progress) {
-        fprintf(stderr, "[WS] Client id=%u busy\n", target_client_id);
-        msg_free(msg);
-        continue;
-      }
-
-      ws_pending_sends[client_idx].msg = msg;
-      ws_pending_sends[client_idx].in_progress = 1;
-
-      // USE NEW FUNCTION - sends backend frame format
-      int result = send_ws_backend_frame(client_fd, msg);
-
-      if (result == 0) {
-        uint64_t latency = get_time_ns() - msg->timestamp_ns;
-        atomic_fetch_add(&metrics_ws.messages_sent, 1);
-        atomic_fetch_add(&metrics_ws.bytes_sent,
-                         BACKEND_HEADER_SIZE + msg->len);
-        atomic_fetch_add(&metrics_ws.latency_sum_ns, latency);
-        atomic_fetch_add(&metrics_ws.latency_count, 1);
-        printf("[WS] Sent backend_id=%u → client_id=%u (%u+12 bytes)\n",
-               msg->backend_id, target_client_id, msg->len);
-        msg_free(msg);
-        ws_pending_sends[client_idx].in_progress = 0;
-        ws_pending_sends[client_idx].msg = NULL;
-      } else if (result == 1) {
-        printf("[WS] Partial send to client_id=%u\n", target_client_id);
-        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-        ev.data.fd = client_fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev);
-      } else {
-        fprintf(stderr, "[WS] Error sending to client_id=%u\n",
-                target_client_id);
-        msg_free(msg);
-        ws_pending_sends[client_idx].in_progress = 0;
-        ws_pending_sends[client_idx].msg = NULL;
-      }
-    }
+    drain_backend_to_ws_queue(epoll_fd);
 
     int n = epoll_wait(epoll_fd, events, EPOLL_EVENTS, 100);
 
@@ -205,6 +423,7 @@ void *ws_thread_fn(void *arg) {
 
       if (fd == eventfd_ws) {
         drain_eventfd(eventfd_ws);
+        drain_backend_to_ws_queue(epoll_fd);
         continue;
       }
 
@@ -223,9 +442,6 @@ void *ws_thread_fn(void *arg) {
             clients[client_fd].state = CLIENT_STATE_HANDSHAKE;
             clients[client_fd].last_activity = time(NULL);
 
-            ws_pending_sends[client_fd % MAX_CLIENTS].in_progress = 0;
-            ws_pending_sends[client_fd % MAX_CLIENTS].msg = NULL;
-
             printf("[WS] New connection: client_id=%d\n", client_fd);
           }
           pthread_mutex_unlock(&clients_lock);
@@ -241,35 +457,9 @@ void *ws_thread_fn(void *arg) {
 
       // Handle EPOLLOUT
       if (events[i].events & EPOLLOUT) {
-        int client_idx = fd % MAX_CLIENTS;
-        if (ws_pending_sends[client_idx].in_progress) {
-          message_t *pending_msg = ws_pending_sends[client_idx].msg;
-
-          // USE NEW FUNCTION
-          int result = send_ws_backend_frame(fd, pending_msg);
-
-          if (result == 0) {
-            uint64_t latency = get_time_ns() - pending_msg->timestamp_ns;
-            atomic_fetch_add(&metrics_ws.messages_sent, 1);
-            atomic_fetch_add(&metrics_ws.bytes_sent,
-                             BACKEND_HEADER_SIZE + pending_msg->len);
-            atomic_fetch_add(&metrics_ws.latency_sum_ns, latency);
-            atomic_fetch_add(&metrics_ws.latency_count, 1);
-            printf("[WS] Completed partial send to client_id=%d\n", fd);
-            msg_free(pending_msg);
-            ws_pending_sends[client_idx].in_progress = 0;
-            ws_pending_sends[client_idx].msg = NULL;
-
-            ev.events = EPOLLIN | EPOLLET;
-            ev.data.fd = fd;
-            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-          } else if (result == -1) {
-            fprintf(stderr, "[WS] Error completing send to client_id=%d\n", fd);
-            msg_free(pending_msg);
-            ws_pending_sends[client_idx].in_progress = 0;
-            ws_pending_sends[client_idx].msg = NULL;
-          }
-        }
+        message_buffer_t *buf = &ws_msg_buffers[fd % MAX_CLIENTS];
+        try_send_buffered_chunks(fd, epoll_fd, buf, send_ws_chunk, &metrics_ws,
+                                 1);
       }
 
       if (!(events[i].events & EPOLLIN)) {
@@ -287,39 +477,31 @@ void *ws_thread_fn(void *arg) {
           clients[fd].state = CLIENT_STATE_ACTIVE;
           printf("[WS] Handshake complete for client_id=%d\n", fd);
 
-          // Send the client its assigned ID
-          // Message format: client_id=<assigned_id>, backend_id=0 (from
-          // gateway), payload="WELCOME"
-          message_t *welcome_msg = msg_alloc(0);
-          if (welcome_msg) {
-            welcome_msg->client_id = fd;
-            welcome_msg->backend_id = 0; // 0 means from gateway itself
-            welcome_msg->len = 0; // Empty payload or you could send "WELCOME"
-            welcome_msg->timestamp_ns = get_time_ns();
+          msg_context_t *ctx = msg_context_alloc();
+          if (ctx) {
+            ctx->client_id = fd;
+            ctx->backend_id = 0;
+            ctx->total_len = 0;
+            ctx->total_chunks = 1;
+            ctx->timestamp_ns = get_time_ns();
 
-            int client_idx = fd % MAX_CLIENTS;
-            if (!ws_pending_sends[client_idx].in_progress) {
-              ws_pending_sends[client_idx].msg = welcome_msg;
-              ws_pending_sends[client_idx].in_progress = 1;
+            chunk_t *welcome = chunk_alloc(0);
+            if (welcome) {
+              welcome->ctx = ctx;
+              welcome->chunk_index = 0;
+              welcome->len = 0;
+              welcome->is_first_chunk = 1;
 
-              int result = send_ws_backend_frame(fd, welcome_msg);
-              if (result == 0) {
-                printf("[WS] Sent ID assignment to client_id=%d\n", fd);
-                msg_free(welcome_msg);
-                ws_pending_sends[client_idx].in_progress = 0;
-                ws_pending_sends[client_idx].msg = NULL;
-              } else if (result == 1) {
-                // Partial send - will complete with EPOLLOUT
-                ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                ev.data.fd = fd;
-                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+              message_buffer_t *buf = &ws_msg_buffers[fd % MAX_CLIENTS];
+              if (buffer_add_chunk(buf, welcome)) {
+                try_send_buffered_chunks(fd, epoll_fd, buf, send_ws_chunk,
+                                         &metrics_ws, 1);
               } else {
-                msg_free(welcome_msg);
-                ws_pending_sends[client_idx].in_progress = 0;
-                ws_pending_sends[client_idx].msg = NULL;
+                msg_context_unref(ctx);
+                chunk_free(welcome);
               }
             } else {
-              msg_free(welcome_msg);
+              msg_context_unref(ctx);
             }
           }
         } else {
@@ -334,138 +516,124 @@ void *ws_thread_fn(void *arg) {
       }
       pthread_mutex_unlock(&clients_lock);
 
-      // USE NEW FUNCTION - parses backend frame format
-      message_t *msg = parse_ws_backend_frame(fd);
-      if (!msg) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-          printf("[WS] Client client_id=%d disconnected\n", fd);
-          epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-          close(fd);
-          pthread_mutex_lock(&clients_lock);
-          if (fd < MAX_CLIENTS && fd > 0)
-            clients[fd].fd = -1;
-          pthread_mutex_unlock(&clients_lock);
-          atomic_fetch_add(&metrics_ws.disconnections, 1);
+      // Read chunks from client
+      chunk_t *chunk;
+      while ((chunk = parse_ws_chunk(fd)) != NULL) {
+        if (!chunk->ctx) {
+          chunk_free(chunk);
+          continue;
         }
-        continue;
-      }
 
-      // IMPORTANT: Override client_id with the actual sender's fd
-      // The client cannot choose its own ID - the gateway assigns it
-      msg->client_id = fd;
+        chunk->ctx->client_id =
+            fd; // IMPORTANT: Set actual client FD as client_id
 
-      // Client now sends messages in backend format!
-      // msg->backend_id is from the client's message (tells us where to route)
+        atomic_fetch_add(&metrics_ws.messages_recv, 1);
+        atomic_fetch_add(&metrics_ws.bytes_recv, chunk->len);
 
-      atomic_fetch_add(&metrics_ws.messages_recv, 1);
-      atomic_fetch_add(&metrics_ws.bytes_recv, BACKEND_HEADER_SIZE + msg->len);
+        printf("[WS] Received chunk %u/%u from client_id=%u → backend_id=%u "
+               "(%u bytes)\n",
+               chunk->chunk_index + 1, chunk->ctx->total_chunks,
+               chunk->ctx->client_id, chunk->ctx->backend_id, chunk->len);
 
-      printf("[WS] Received client_id=%u → backend_id=%u (%u+12 bytes)\n",
-             msg->client_id, msg->backend_id, msg->len);
-
-      // Route to backend(s)
-      if (msg->backend_id == 0) {
         // Broadcast to all backends
-        int backend_broadcast_count = 0;
-        for (int j = 0; j < backend_server_count; j++) {
-          if (atomic_load(&backends[j].connected)) {
-            message_t *broadcast_msg = msg_alloc(msg->len);
-            if (broadcast_msg) {
-              broadcast_msg->client_id = msg->client_id;
-              broadcast_msg->backend_id = j + 1;
-              broadcast_msg->len = msg->len;
-              broadcast_msg->timestamp_ns = msg->timestamp_ns;
-              memcpy(broadcast_msg->data, msg->data, msg->len);
+        if (chunk->ctx->backend_id == 0) {
+          int backend_broadcast_count = 0;
+          for (int j = 0; j < backend_server_count; j++) {
+            if (atomic_load(&backends[j].connected)) {
+              chunk_t *bc = chunk_alloc(chunk->len);
+              if (bc) {
+                bc->ctx = chunk->ctx;
+                msg_context_ref(chunk->ctx);
+                bc->chunk_index = chunk->chunk_index;
+                bc->len = chunk->len;
+                bc->is_first_chunk = chunk->is_first_chunk;
+                memcpy(bc->data, chunk->data, chunk->len);
 
-              if (queue_push(&q_ws_to_backend, broadcast_msg)) {
-                backend_broadcast_count++;
-              } else {
-                msg_free(broadcast_msg);
+                if (queue_push(&q_ws_to_backend, bc)) {
+                  backend_broadcast_count++;
+                } else {
+                  msg_context_unref(bc->ctx);
+                  chunk_free(bc);
+                }
               }
             }
           }
-        }
 
-        if (backend_broadcast_count > 0) {
-          signal_eventfd(eventfd_backend);
-          printf("[WS] Broadcast client_id=%u → %d backends\n", msg->client_id,
-                 backend_broadcast_count);
-        }
+          if (backend_broadcast_count > 0) {
+            signal_eventfd(eventfd_backend);
+          }
 
-        // NEW: Also broadcast to all clients
-        int client_broadcast_count = 0;
-        pthread_mutex_lock(&clients_lock);
-        for (int j = 1; j < MAX_CLIENTS; j++) {
-          if (clients[j].fd > 0 && clients[j].state == CLIENT_STATE_ACTIVE) {
-            message_t *client_msg = msg_alloc(msg->len);
-            if (client_msg) {
-              client_msg->client_id = clients[j].fd;
-              client_msg->backend_id = msg->backend_id;
-              client_msg->len = msg->len;
-              client_msg->timestamp_ns = msg->timestamp_ns;
-              memcpy(client_msg->data, msg->data, msg->len);
+          // Broadcast to other clients
+          int client_broadcast_count = 0;
+          pthread_mutex_lock(&clients_lock);
+          for (int j = 1; j < MAX_CLIENTS; j++) {
+            if (clients[j].fd > 0 && clients[j].fd != fd &&
+                clients[j].state == CLIENT_STATE_ACTIVE) {
+              chunk_t *cc = chunk_alloc(chunk->len);
+              if (cc) {
+                cc->ctx = chunk->ctx;
+                msg_context_ref(chunk->ctx);
+                cc->chunk_index = chunk->chunk_index;
+                cc->len = chunk->len;
+                cc->is_first_chunk = chunk->is_first_chunk;
+                memcpy(cc->data, chunk->data, chunk->len);
 
-              int client_fd = clients[j].fd;
-              int client_idx = client_fd % MAX_CLIENTS;
-              if (!ws_pending_sends[client_idx].in_progress) {
-                ws_pending_sends[client_idx].msg = client_msg;
-                ws_pending_sends[client_idx].in_progress = 1;
+                int client_fd = clients[j].fd;
+                message_buffer_t *buf =
+                    &ws_msg_buffers[client_fd % MAX_CLIENTS];
 
-                int result = send_ws_backend_frame(client_fd, client_msg);
-                if (result == 0) {
-                  atomic_fetch_add(&metrics_ws.messages_sent, 1);
-                  atomic_fetch_add(&metrics_ws.bytes_sent,
-                                   BACKEND_HEADER_SIZE + client_msg->len);
-                  msg_free(client_msg);
-                  ws_pending_sends[client_idx].in_progress = 0;
-                  ws_pending_sends[client_idx].msg = NULL;
-                  client_broadcast_count++;
-                } else if (result == 1) {
-                  ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                  ev.data.fd = client_fd;
-                  epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev);
+                if (buffer_add_chunk(buf, cc)) {
+                  try_send_buffered_chunks(client_fd, epoll_fd, buf,
+                                           send_ws_chunk, &metrics_ws, 1);
                   client_broadcast_count++;
                 } else {
-                  msg_free(client_msg);
-                  ws_pending_sends[client_idx].in_progress = 0;
-                  ws_pending_sends[client_idx].msg = NULL;
+                  msg_context_unref(cc->ctx);
+                  chunk_free(cc);
                 }
-              } else {
-                msg_free(client_msg);
               }
             }
           }
+          pthread_mutex_unlock(&clients_lock);
+
+          msg_context_unref(chunk->ctx);
+          chunk_free(chunk);
+          continue;
         }
-        pthread_mutex_unlock(&clients_lock);
 
-        if (client_broadcast_count > 0) {
-          printf("[WS] Also broadcast to %d clients\n", client_broadcast_count);
-        }
-
-        msg_free(msg);
-        continue;
-      } else {
-        // Unicast to specific backend
-        int backend_slot = msg->backend_id - 1;
-
+        // Send to specific backend
+        int backend_slot = chunk->ctx->backend_id - 1;
         if (backend_slot >= 0 && backend_slot < backend_server_count &&
             atomic_load(&backends[backend_slot].connected)) {
-
-          if (queue_push(&q_ws_to_backend, msg)) {
+          if (queue_push(&q_ws_to_backend, chunk)) {
             signal_eventfd(eventfd_backend);
             continue;
-          } else {
-            fprintf(stderr, "[WS] Queue full, dropping message\n");
           }
-        } else {
-          fprintf(stderr, "[WS] Backend_id=%u not connected\n",
-                  msg->backend_id);
         }
+
+        msg_context_unref(chunk->ctx);
+        chunk_free(chunk);
       }
 
-      msg_free(msg);
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        printf("[WS] Client client_id=%d disconnected\n", fd);
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+        pthread_mutex_lock(&clients_lock);
+        if (fd < MAX_CLIENTS && fd > 0) {
+          clients[fd].fd = -1;
+          free_message_buffer(&ws_msg_buffers[fd % MAX_CLIENTS]);
+        }
+        pthread_mutex_unlock(&clients_lock);
+        atomic_fetch_add(&metrics_ws.disconnections, 1);
+      }
     }
   }
+
+  // Cleanup
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    free_message_buffer(&ws_msg_buffers[i]);
+  }
+  free(ws_msg_buffers);
 
   close(epoll_fd);
   printf("[WS Thread] Stopped\n");
@@ -479,20 +647,24 @@ void *backend_thread_fn(void *arg) {
     return NULL;
   }
 
-  // Add eventfd
+  // Initialize message buffers
+  backend_msg_buffers = calloc(MAX_BACKENDS, sizeof(message_buffer_t));
+  for (int i = 0; i < MAX_BACKENDS; i++) {
+    init_message_buffer(&backend_msg_buffers[i], 32);
+  }
+
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.fd = eventfd_backend;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventfd_backend, &ev);
 
-  printf("[Backend Thread] Started, connecting to %d backend servers\n",
-         backend_server_count);
+  printf("[Backend Thread] Started - chunked operation mode with message "
+         "buffering\n");
 
   struct epoll_event events[EPOLL_EVENTS];
   time_t last_reconnect = 0;
 
   while (atomic_load_explicit(&running, memory_order_acquire)) {
-    // Attempt to connect/reconnect backends
     time_t now = time(NULL);
     if (now - last_reconnect >= RECONNECT_INTERVAL) {
       for (int i = 0; i < backend_server_count; i++) {
@@ -507,10 +679,6 @@ void *backend_thread_fn(void *arg) {
                                   memory_order_release);
             backends[i].reconnect_count++;
 
-            // Initialize send state
-            backend_pending_sends[fd % MAX_BACKENDS].in_progress = 0;
-            backend_pending_sends[fd % MAX_BACKENDS].msg = NULL;
-
             ev.events = EPOLLIN | EPOLLET;
             ev.data.fd = fd;
             epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
@@ -519,83 +687,49 @@ void *backend_thread_fn(void *arg) {
                                       memory_order_relaxed);
             printf("[Backend] Connected to %s:%d (fd=%d, backend_id=%d)\n",
                    backend_servers[i].host, backend_servers[i].port, fd, i + 1);
-          } else {
-            printf("[Backend] Failed to connect to %s:%d (backend_id=%d)\n",
-                   backend_servers[i].host, backend_servers[i].port, i + 1);
           }
         }
       }
       last_reconnect = now;
     }
 
-    // Process outgoing messages from queue
-    message_t *msg;
-    while ((msg = queue_pop(&q_ws_to_backend)) != NULL) {
-      int backend_slot = msg->backend_id - 1; // Convert to 0-based slot
+    // Process outgoing chunks
+    chunk_t *chunk;
+    while ((chunk = queue_pop(&q_ws_to_backend)) != NULL) {
+      if (!chunk->ctx) {
+        chunk_free(chunk);
+        continue;
+      }
+
+      int backend_slot = chunk->ctx->backend_id - 1;
 
       if (backend_slot < 0 || backend_slot >= backend_server_count) {
-        fprintf(stderr, "[Backend] Invalid backend_id=%u, dropping message\n",
-                msg->backend_id);
-        msg_free(msg);
+        fprintf(stderr, "[Backend] Invalid backend_id=%u\n",
+                chunk->ctx->backend_id);
+        msg_context_unref(chunk->ctx);
+        chunk_free(chunk);
         continue;
       }
 
       if (!atomic_load_explicit(&backends[backend_slot].connected,
                                 memory_order_acquire)) {
-        fprintf(stderr,
-                "[Backend] Backend_id=%u not connected, dropping message\n",
-                msg->backend_id);
-        msg_free(msg);
+        fprintf(stderr, "[Backend] Backend_id=%u not connected\n",
+                chunk->ctx->backend_id);
+        msg_context_unref(chunk->ctx);
+        chunk_free(chunk);
         continue;
       }
 
       int backend_fd = backends[backend_slot].fd;
-      int backend_idx = backend_fd % MAX_BACKENDS;
+      message_buffer_t *buf = &backend_msg_buffers[backend_fd % MAX_BACKENDS];
 
-      // Check if there's already a pending send
-      if (backend_pending_sends[backend_idx].in_progress) {
-        fprintf(stderr,
-                "[Backend] Backend_id=%u has pending send, dropping message\n",
-                msg->backend_id);
-        msg_free(msg);
-        continue;
-      }
-
-      // Start sending
-      backend_pending_sends[backend_idx].msg = msg;
-      backend_pending_sends[backend_idx].client_id = msg->client_id;
-      backend_pending_sends[backend_idx].backend_id = msg->backend_id;
-      backend_pending_sends[backend_idx].in_progress = 1;
-
-      int result =
-          write_backend_frame(backend_fd, msg, msg->client_id, msg->backend_id);
-
-      if (result == 0) {
-        // Complete send
-        atomic_fetch_add_explicit(&metrics_backend.messages_sent, 1,
-                                  memory_order_relaxed);
-        atomic_fetch_add_explicit(&metrics_backend.bytes_sent, msg->len,
-                                  memory_order_relaxed);
-        printf("[Backend] Sent %u bytes from client_id=%u to backend_id=%u\n",
-               msg->len, msg->client_id, msg->backend_id);
-        msg_free(msg);
-        backend_pending_sends[backend_idx].in_progress = 0;
-        backend_pending_sends[backend_idx].msg = NULL;
-      } else if (result == 1) {
-        // Partial send - add EPOLLOUT
-        printf(
-            "[Backend] Partial send to backend_id=%u, waiting for EPOLLOUT\n",
-            msg->backend_id);
-        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-        ev.data.fd = backend_fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, backend_fd, &ev);
+      if (buffer_add_chunk(buf, chunk)) {
+        try_send_buffered_chunks(backend_fd, epoll_fd, buf, write_backend_chunk,
+                                 &metrics_backend, 0);
       } else {
-        // Error - cleanup
-        fprintf(stderr, "[Backend] Error sending to backend_id=%u\n",
-                msg->backend_id);
-        msg_free(msg);
-        backend_pending_sends[backend_idx].in_progress = 0;
-        backend_pending_sends[backend_idx].msg = NULL;
+        fprintf(stderr, "[Backend] Buffer full, dropping chunk\n");
+        msg_context_unref(chunk->ctx);
+        chunk_free(chunk);
       }
     }
 
@@ -609,127 +743,89 @@ void *backend_thread_fn(void *arg) {
         continue;
       }
 
-      // Handle EPOLLOUT - continue pending send
       if (events[i].events & EPOLLOUT) {
-        int backend_idx = fd % MAX_BACKENDS;
-        if (backend_pending_sends[backend_idx].in_progress) {
-          message_t *pending_msg = backend_pending_sends[backend_idx].msg;
-          uint32_t client_id = backend_pending_sends[backend_idx].client_id;
-          uint32_t backend_id = backend_pending_sends[backend_idx].backend_id;
-
-          int result =
-              write_backend_frame(fd, pending_msg, client_id, backend_id);
-
-          if (result == 0) {
-            // Complete send
-            atomic_fetch_add_explicit(&metrics_backend.messages_sent, 1,
-                                      memory_order_relaxed);
-            atomic_fetch_add_explicit(&metrics_backend.bytes_sent,
-                                      pending_msg->len, memory_order_relaxed);
-            printf("[Backend] Completed partial send: %u bytes from "
-                   "client_id=%u to backend_id=%u\n",
-                   pending_msg->len, client_id, backend_id);
-            msg_free(pending_msg);
-            backend_pending_sends[backend_idx].in_progress = 0;
-            backend_pending_sends[backend_idx].msg = NULL;
-
-            // Remove EPOLLOUT
-            ev.events = EPOLLIN | EPOLLET;
-            ev.data.fd = fd;
-            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-          } else if (result == -1) {
-            // Error - cleanup
-            fprintf(stderr, "[Backend] Error completing send to fd=%d\n", fd);
-            msg_free(pending_msg);
-            backend_pending_sends[backend_idx].in_progress = 0;
-            backend_pending_sends[backend_idx].msg = NULL;
-          }
-        }
+        message_buffer_t *buf = &backend_msg_buffers[fd % MAX_BACKENDS];
+        try_send_buffered_chunks(fd, epoll_fd, buf, write_backend_chunk,
+                                 &metrics_backend, 0);
       }
 
-      // Handle EPOLLIN
       if (!(events[i].events & EPOLLIN)) {
         continue;
       }
 
-      // Read backend frame
-      message_t *msg = read_backend_frame(fd);
-      if (!msg) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-          // Find which backend slot disconnected
-          for (int j = 0; j < backend_server_count; j++) {
-            if (backends[j].fd == fd) {
-              epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-              close(fd);
-              backends[j].fd = -1;
-              atomic_store_explicit(&backends[j].connected, 0,
-                                    memory_order_release);
-              atomic_fetch_add_explicit(&metrics_backend.disconnections, 1,
-                                        memory_order_relaxed);
-              printf(
-                  "[Backend] Disconnected from %s:%d (fd=%d, backend_id=%d)\n",
-                  backend_servers[j].host, backend_servers[j].port, fd, j + 1);
+      // Read chunks from backend
+      chunk_t *chunk;
+      while ((chunk = read_backend_chunk(fd)) != NULL) {
+        if (!chunk->ctx) {
+          chunk_free(chunk);
+          continue;
+        }
 
-              // Cleanup any pending send
-              int backend_idx = fd % MAX_BACKENDS;
-              if (backend_pending_sends[backend_idx].in_progress) {
-                msg_free(backend_pending_sends[backend_idx].msg);
-                backend_pending_sends[backend_idx].in_progress = 0;
-                backend_pending_sends[backend_idx].msg = NULL;
-              }
-              break;
-            }
+        // Find which backend slot this is (for logging only, don't modify
+        // chunk->ctx->backend_id!)
+        int backend_slot = -1;
+        for (int j = 0; j < backend_server_count; j++) {
+          if (backends[j].fd == fd) {
+            backend_slot = j;
+            break;
           }
         }
-        continue;
-      }
 
-      // Find which backend this came from
-      int backend_slot = -1;
-      for (int j = 0; j < backend_server_count; j++) {
-        if (backends[j].fd == fd) {
-          backend_slot = j;
-          break;
+        atomic_fetch_add_explicit(&metrics_backend.messages_recv, 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&metrics_backend.bytes_recv, chunk->len,
+                                  memory_order_relaxed);
+
+        printf("[Backend] Received chunk %u/%u from backend slot %d (fd=%d): "
+               "%u bytes → client_id=%u\n",
+               chunk->chunk_index + 1, chunk->ctx->total_chunks, backend_slot,
+               fd, chunk->len, chunk->ctx->client_id);
+
+        // IMPORTANT: Do NOT modify chunk->ctx->backend_id here
+        // The backend_id in the chunk was set by the backend server itself
+        // The client_id tells us where to route this response
+
+        if (!queue_push(&q_backend_to_ws, chunk)) {
+          fprintf(stderr, "[Backend] Queue full, dropping chunk\n");
+          msg_context_unref(chunk->ctx);
+          chunk_free(chunk);
+        } else {
+          signal_eventfd(eventfd_ws);
         }
       }
 
-      if (backend_slot == -1) {
-        fprintf(stderr,
-                "[Backend] Received message from unknown fd=%d, dropping\n",
-                fd);
-        msg_free(msg);
-        continue;
-      }
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        for (int j = 0; j < backend_server_count; j++) {
+          if (backends[j].fd == fd) {
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);
+            backends[j].fd = -1;
+            atomic_store_explicit(&backends[j].connected, 0,
+                                  memory_order_release);
+            atomic_fetch_add_explicit(&metrics_backend.disconnections, 1,
+                                      memory_order_relaxed);
+            printf("[Backend] Disconnected from %s:%d (fd=%d, backend_id=%d)\n",
+                   backend_servers[j].host, backend_servers[j].port, fd, j + 1);
 
-      // Set backend_id to the 1-based slot
-      msg->backend_id = backend_slot + 1;
-
-      atomic_fetch_add_explicit(&metrics_backend.messages_recv, 1,
-                                memory_order_relaxed);
-      atomic_fetch_add_explicit(&metrics_backend.bytes_recv, msg->len,
-                                memory_order_relaxed);
-
-      printf("[Backend] Received %u bytes from backend_id=%u targeting "
-             "client_id=%u\n",
-             msg->len, msg->backend_id, msg->client_id);
-
-      if (!queue_push(&q_backend_to_ws, msg)) {
-        fprintf(stderr,
-                "[Backend] Queue full, dropping message from backend_id=%u\n",
-                msg->backend_id);
-        msg_free(msg);
-      } else {
-        signal_eventfd(eventfd_ws);
+            free_message_buffer(&backend_msg_buffers[fd % MAX_BACKENDS]);
+            break;
+          }
+        }
       }
     }
   }
 
-  // Cleanup backend connections
+  // Cleanup
   for (int i = 0; i < backend_server_count; i++) {
     if (backends[i].fd >= 0) {
       close(backends[i].fd);
     }
   }
+
+  for (int i = 0; i < MAX_BACKENDS; i++) {
+    free_message_buffer(&backend_msg_buffers[i]);
+  }
+  free(backend_msg_buffers);
 
   close(epoll_fd);
   printf("[Backend Thread] Stopped\n");
@@ -742,124 +838,54 @@ void *monitor_thread_fn(void *arg) {
   while (atomic_load_explicit(&running, memory_order_acquire)) {
     sleep(5);
 
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("Tiered Memory Pool:\n");
+    printf("═══════════════════════════════════════════════════════════\n");
+    printf("Tiered Memory Pool (Chunked):\n");
 
-    // Global pool statistics
     uint64_t total_allocs = atomic_load(&g_tiered_pool.total_allocs);
     uint64_t total_frees = atomic_load(&g_tiered_pool.total_frees);
     uint64_t in_use = total_allocs - total_frees;
 
-    printf("   Total Allocations:  %10lu\n", total_allocs);
-    printf("   Total Frees:        %10lu\n", total_frees);
-    printf("   Messages In-Use:    %10lu\n", in_use);
-    uint32_t total_slots_free = 0;
-    uint32_t total_slots = 0;
+    printf("   Total Chunk Allocations: %10lu\n", total_allocs);
+    printf("   Total Frees:             %10lu\n", total_frees);
+    printf("   Chunks In-Use:           %10lu\n", in_use);
 
     for (int i = 0; i < TIER_COUNT; i++) {
       uint32_t free, total, failures;
       uint64_t allocs;
       pool_get_tier_stats(i, &free, &total, &allocs, &failures);
-      total_slots_free += free;
-      total_slots += total;
-    }
-    // Overall pool utilization
-    uint32_t total_used = total_slots - total_slots_free;
-    float overall_usage =
-        (total_slots > 0) ? (100.0f * total_used / total_slots) : 0.0f;
-    printf("   TOTAL: %4u/%4u slots used (%.1f%% utilization)\n", total_used,
-           total_slots, overall_usage);
 
-    // Memory usage estimation
-    uint64_t tier_sizes[] = {512, 4096, 32768, 262144, 1048576, 8388608};
-    uint64_t memory_in_use = 0;
-    for (int i = 0; i < TIER_COUNT; i++) {
-      uint32_t free, total, failures;
-      uint64_t allocs;
-      pool_get_tier_stats(i, &free, &total, &allocs, &failures);
-      memory_in_use += (total - free) * (tier_sizes[i] + sizeof(message_t));
+      uint32_t used = total - free;
+      float usage = (total > 0) ? (100.0f * used / total) : 0.0f;
+      printf(
+          "   Tier %d: %4u/%4u slots (%.1f%%) | allocs: %lu | failures: %u\n",
+          i, used, total, usage, allocs, failures);
     }
-    printf("   Estimated Memory In-Use: %.2f MB\n",
-           memory_in_use / (1024.0 * 1024.0));
 
-    // WebSocket Thread
+    uint32_t ctx_free, ctx_total;
+    pool_get_ctx_stats(&ctx_free, &ctx_total);
+    uint32_t ctx_used = ctx_total - ctx_free;
+    float ctx_usage = (ctx_total > 0) ? (100.0f * ctx_used / ctx_total) : 0.0f;
+    printf("   Message Contexts: %4u/%4u (%.1f%% used)\n", ctx_used, ctx_total,
+           ctx_usage);
+
     printf("WebSocket Thread:\n");
     uint64_t ws_sent = atomic_load(&metrics_ws.messages_sent);
     uint64_t ws_recv = atomic_load(&metrics_ws.messages_recv);
     uint64_t ws_bytes_s = atomic_load(&metrics_ws.bytes_sent);
     uint64_t ws_bytes_r = atomic_load(&metrics_ws.bytes_recv);
-    uint32_t ws_conn = atomic_load(&metrics_ws.connections);
-    uint32_t ws_disc = atomic_load(&metrics_ws.disconnections);
 
-    printf("   Sent:       %10lu msgs  |  %10lu bytes\n", ws_sent, ws_bytes_s);
-    printf("   Received:   %10lu msgs  |  %10lu bytes\n", ws_recv, ws_bytes_r);
-    printf("   Connections:  %6u total  |  %6u disconnections\n", ws_conn,
-           ws_disc);
+    printf("   Chunks Sent:    %10lu  |  %10lu bytes\n", ws_sent, ws_bytes_s);
+    printf("   Chunks Received:%10lu  |  %10lu bytes\n", ws_recv, ws_bytes_r);
 
-    uint32_t lat_count = atomic_load(&metrics_ws.latency_count);
-    if (lat_count > 0) {
-      uint64_t lat_sum = atomic_load(&metrics_ws.latency_sum_ns);
-      uint64_t avg_lat = lat_sum / lat_count;
-      printf("   Avg Latency: %8lu ns  |  %6.2f µs\n", avg_lat,
-             avg_lat / 1000.0);
-    }
-
-    // Broadcast Statistics
-    printf("Broadcast Statistics:\n");
-
-    // Count active backends
-    int active_backends = 0;
-    for (int i = 0; i < backend_server_count; i++) {
-      if (atomic_load(&backends[i].connected))
-        active_backends++;
-    }
-
-    // Calculate broadcast multiplier
-    float broadcast_ratio =
-        (ws_recv > 0) ? (float)atomic_load(&metrics_backend.messages_sent) /
-                            (float)ws_recv
-                      : 0.0f;
-
-    printf("   Active Backends:    %2d / %-2d\n", active_backends,
-           backend_server_count);
-    printf("   Broadcast Ratio:    1 msg → %.1f backends avg\n",
-           broadcast_ratio);
-    printf("   Total Broadcasted:  %10lu messages\n",
-           atomic_load(&metrics_backend.messages_sent));
-
-    // Show individual backend status
-    if (backend_server_count > 0) {
-      printf("Backend Connections:\n");
-      for (int i = 0; i < backend_server_count && i < 8; i++) {
-        int connected = atomic_load(&backends[i].connected);
-        uint32_t reconnects = backends[i].reconnect_count;
-
-        char status_icon = connected ? '+' : 'x';
-        printf("   [%d] %-15s:%-5d  [%c]  reconnects: %3u\n", i,
-               backend_servers[i].host, backend_servers[i].port, status_icon,
-               reconnects);
-      }
-
-      if (backend_server_count > 8) {
-        printf("   ... and %d more backends\n", backend_server_count - 8);
-      }
-    }
-
-    // Backend Thread
     printf("Backend Thread:\n");
     uint64_t be_sent = atomic_load(&metrics_backend.messages_sent);
     uint64_t be_recv = atomic_load(&metrics_backend.messages_recv);
     uint64_t be_bytes_s = atomic_load(&metrics_backend.bytes_sent);
     uint64_t be_bytes_r = atomic_load(&metrics_backend.bytes_recv);
-    uint32_t be_conn = atomic_load(&metrics_backend.connections);
-    uint32_t be_disc = atomic_load(&metrics_backend.disconnections);
 
-    printf("   Sent: %10lu msgs  |  %10lu bytes\n", be_sent, be_bytes_s);
-    printf("   Received: %10lu msgs  |  %10lu bytes\n", be_recv, be_bytes_r);
-    printf("   Connections: %6u total  |  %6u disconnections\n", be_conn,
-           be_disc);
+    printf("   Chunks Sent:    %10lu  |  %10lu bytes\n", be_sent, be_bytes_s);
+    printf("   Chunks Received:%10lu  |  %10lu bytes\n", be_recv, be_bytes_r);
 
-    // Queue Statistics
     printf("Queue Statistics:\n");
     uint32_t q1_depth = queue_depth(&q_ws_to_backend);
     uint32_t q1_drops = atomic_load(&q_ws_to_backend.drops);
@@ -872,6 +898,15 @@ void *monitor_thread_fn(void *arg) {
     uint32_t q2_hw = atomic_load(&q_backend_to_ws.high_water);
     printf("   Backend→WS:  depth=%4u | drops=%6u | HW=%4u\n", q2_depth,
            q2_drops, q2_hw);
+
+    printf("Backend Connections:\n");
+    for (int i = 0; i < backend_server_count && i < 8; i++) {
+      int connected = atomic_load(&backends[i].connected);
+      char status = connected ? '+' : 'x';
+      printf("   [%d] %s:%d [%c]\n", i, backend_servers[i].host,
+             backend_servers[i].port, status);
+    }
+
     printf(
         "═══════════════════════════════════════════════════════════════\n\n");
   }

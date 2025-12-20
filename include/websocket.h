@@ -3,20 +3,27 @@
 
 #include "mempool.h"
 
-// ---------- WebSocket state ----------
+// ---------- WebSocket Read State ----------
 typedef struct {
-  uint8_t buffer[MAX_MESSAGE_SIZE];
+  uint8_t buffer[16384]; // Buffer for WebSocket frame header + partial data
   uint32_t pos;
-} ws_state_t;
+  uint8_t header_parsed;
+  uint64_t payload_len;
+  uint32_t header_size;
+  uint8_t masked;
+  uint8_t mask[4];
+  uint32_t payload_read;   // Bytes of payload read so far
+  msg_context_t *ctx;      // Current message context
+  uint32_t chunks_created; // Number of chunks created for current message
+} ws_read_state_t;
 
 // ---------- WebSocket Send State ----------
 typedef struct {
-  uint8_t header[26]; // Was 14, now: 2 + 8 (extended length) + 4 (mask) + 12
-                      // (backend header)
+  uint8_t header[26]; // WS header + backend header
   uint32_t header_len;
   uint32_t header_sent;
-  uint32_t data_sent;
-  uint32_t total_len;
+  uint32_t data_sent; // Bytes sent from current chunk
+  chunk_t *current_chunk;
 } ws_send_state_t;
 
 // WebSocket frame flags / opcodes
@@ -26,7 +33,7 @@ typedef struct {
 #define WS_OPCODE_CLOSE 0x08
 #define WS_MASK 0x80
 
-extern ws_state_t *ws_states;
+extern ws_read_state_t *ws_read_states;
 extern ws_send_state_t *ws_send_states;
 
 // API
@@ -37,10 +44,10 @@ int handle_ws_handshake(int fd);
 void ws_init(void);
 void ws_cleanup(void);
 
-// Returns: message if complete frame received, NULL if incomplete or error
-message_t *parse_ws_backend_frame(int fd);
+// Returns: chunk if chunk received, NULL if incomplete or error
+chunk_t *parse_ws_chunk(int fd);
 
 // Returns: 0 if complete, 1 if partial (call again), -1 on error
-int send_ws_backend_frame(int fd, message_t *msg);
+int send_ws_chunk(int fd, chunk_t *chunk);
 
 #endif // __WEBSOCKET_H__

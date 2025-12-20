@@ -6,7 +6,7 @@
 #include <time.h>
 
 // --------- Global Limits ---------
-#define QUEUE_SIZE 4096
+#define QUEUE_SIZE (16 * 1024 * 1024)
 #define POOL_SIZE 8192
 #define MAX_CLIENTS 1024
 #define MAX_BACKENDS 16
