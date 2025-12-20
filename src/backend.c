@@ -109,9 +109,8 @@ chunk_t *read_backend_chunk(int fd) {
     st->ctx->client_id = st->client_id;
     st->ctx->backend_id = st->backend_id;
     st->ctx->total_len = st->expected_len;
-    st->ctx->chunks_sent = 0;
-    st->ctx->total_chunks =
-        (st->expected_len + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
+    st->ctx->bytes_sent = 0;
+    st->ctx->complete = 0;
     st->ctx->timestamp_ns = get_time_ns();
 
     st->bytes_read = 0;
@@ -121,6 +120,7 @@ chunk_t *read_backend_chunk(int fd) {
   // Step 2: Read payload in chunks
   uint32_t remaining = st->expected_len - st->bytes_read;
   if (remaining == 0) {
+    st->ctx->complete = 1;
     // Message complete - release our reference and reset
     msg_context_unref(st->ctx);
     st->ctx = NULL;
@@ -158,6 +158,7 @@ chunk_t *read_backend_chunk(int fd) {
           chunk->chunk_index = st->chunks_created;
           st->chunks_created++; // Increment AFTER assignment
           chunk->len = chunk_pos;
+          chunk->is_last_chunk = 0;
           chunk->is_first_chunk = (chunk->chunk_index == 0) ? 1 : 0;
           st->bytes_read += chunk_pos;
           return chunk;
@@ -200,11 +201,14 @@ chunk_t *read_backend_chunk(int fd) {
   chunk->chunk_index = st->chunks_created;
   st->chunks_created++; // Increment AFTER assignment
   chunk->len = chunk_pos;
+  chunk->is_last_chunk =
+      (st->bytes_read + chunk_pos >= st->expected_len) ? 1 : 0;
   chunk->is_first_chunk = (chunk->chunk_index == 0) ? 1 : 0;
   st->bytes_read += chunk_pos;
 
   // Check if this is the last chunk
   if (st->bytes_read >= st->expected_len) {
+    st->ctx->complete = 1;
     // Message reading complete - release read state's reference
     msg_context_unref(st->ctx);
     st->ctx = NULL;

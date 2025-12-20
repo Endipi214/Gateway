@@ -24,7 +24,6 @@ typedef struct message_entry {
   uint32_t ctx_id;
   chunk_t **chunks;
   uint32_t chunk_count;
-  uint32_t total_chunks;
   uint32_t next_send_index;
   int complete;
   struct message_entry *next;
@@ -111,8 +110,8 @@ static message_entry_t *find_or_create_message(message_buffer_t *buf,
     return NULL;
 
   entry->ctx_id = chunk->ctx->ctx_id;
-  entry->total_chunks = chunk->ctx->total_chunks;
-  entry->chunks = calloc(entry->total_chunks, sizeof(chunk_t *));
+  entry->chunks =
+      calloc(256, sizeof(chunk_t *)); // Max 256 chunks (16MB @ 64KB chunks)
   if (!entry->chunks) {
     free(entry);
     return NULL;
@@ -140,19 +139,13 @@ static int buffer_add_chunk(message_buffer_t *buf, chunk_t *chunk) {
   if (!entry)
     return 0;
 
-  // Check if chunk already exists (duplicate)
-  if (chunk->chunk_index < entry->total_chunks &&
-      entry->chunks[chunk->chunk_index] != NULL) {
-    return 1; // Already have this chunk, silently ignore
-  }
-
   // Store chunk in its position
-  if (chunk->chunk_index < entry->total_chunks) {
+  if (chunk->chunk_index < 256) {
     entry->chunks[chunk->chunk_index] = chunk;
     entry->chunk_count++;
 
     // Check if message is complete
-    if (entry->chunk_count >= entry->total_chunks) {
+    if (chunk->is_last_chunk) {
       entry->complete = 1;
     }
   }
@@ -180,7 +173,7 @@ static chunk_t *buffer_get_next_chunk(message_buffer_t *buf) {
   message_entry_t *sending = buf->sending;
 
   // Get next chunk in sequence
-  if (sending->next_send_index >= sending->total_chunks) {
+  if (sending->next_send_index >= sending->chunk_count) {
     // Message complete, remove from queue
     if (buf->head == sending) {
       buf->head = sending->next;
@@ -258,12 +251,12 @@ static void try_send_buffered_chunks(int fd, int epoll_fd,
       atomic_fetch_add(&metrics->bytes_sent, chunk->len);
 
       if (is_ws) {
-        printf("[WS] Sent chunk %u/%u → client_id=%u (%u bytes)\n",
-               chunk->chunk_index + 1, chunk->ctx->total_chunks,
+        printf("[WS] Sent chunk %u%s → client_id=%u (%u bytes)\n",
+               chunk->chunk_index + 1, chunk->is_last_chunk ? " (LAST)" : "",
                chunk->ctx->client_id, chunk->len);
       } else {
-        printf("[Backend] Sent chunk %u/%u → backend_id=%u (%u bytes)\n",
-               chunk->chunk_index + 1, chunk->ctx->total_chunks,
+        printf("[Backend] Sent chunk %u%s → backend_id=%u (%u bytes)\n",
+               chunk->chunk_index + 1, chunk->is_last_chunk ? " (LAST)" : "",
                chunk->ctx->backend_id, chunk->len);
       }
 
@@ -340,9 +333,9 @@ static void drain_backend_to_ws_queue(int epoll_fd) {
       }
       pthread_mutex_unlock(&clients_lock);
 
-      printf("[WS] Broadcast chunk %u/%u → %d clients (%u bytes)\n",
-             chunk->chunk_index + 1, chunk->ctx->total_chunks, broadcast_count,
-             chunk->len);
+      printf("[WS] Broadcast chunk %u%s → %d clients (%u bytes)\n",
+             chunk->chunk_index + 1, chunk->is_last_chunk ? " (LAST)" : "",
+             broadcast_count, chunk->len);
       msg_context_unref(chunk->ctx);
       chunk_free(chunk);
       continue;
@@ -482,7 +475,7 @@ void *ws_thread_fn(void *arg) {
             ctx->client_id = fd;
             ctx->backend_id = 0;
             ctx->total_len = 0;
-            ctx->total_chunks = 1;
+            ctx->complete = 0;
             ctx->timestamp_ns = get_time_ns();
 
             chunk_t *welcome = chunk_alloc(0);
@@ -491,6 +484,7 @@ void *ws_thread_fn(void *arg) {
               welcome->chunk_index = 0;
               welcome->len = 0;
               welcome->is_first_chunk = 1;
+              welcome->is_last_chunk = 1;
 
               message_buffer_t *buf = &ws_msg_buffers[fd % MAX_CLIENTS];
               if (buffer_add_chunk(buf, welcome)) {
@@ -530,9 +524,9 @@ void *ws_thread_fn(void *arg) {
         atomic_fetch_add(&metrics_ws.messages_recv, 1);
         atomic_fetch_add(&metrics_ws.bytes_recv, chunk->len);
 
-        printf("[WS] Received chunk %u/%u from client_id=%u → backend_id=%u "
+        printf("[WS] Received chunk %u%s from client_id=%u → backend_id=%u "
                "(%u bytes)\n",
-               chunk->chunk_index + 1, chunk->ctx->total_chunks,
+               chunk->chunk_index + 1, chunk->is_last_chunk ? " (LAST)" : "",
                chunk->ctx->client_id, chunk->ctx->backend_id, chunk->len);
 
         // Broadcast to all backends
@@ -776,10 +770,10 @@ void *backend_thread_fn(void *arg) {
         atomic_fetch_add_explicit(&metrics_backend.bytes_recv, chunk->len,
                                   memory_order_relaxed);
 
-        printf("[Backend] Received chunk %u/%u from backend slot %d (fd=%d): "
+        printf("[Backend] Received chunk %u%s from backend slot %d (fd=%d): "
                "%u bytes → client_id=%u\n",
-               chunk->chunk_index + 1, chunk->ctx->total_chunks, backend_slot,
-               fd, chunk->len, chunk->ctx->client_id);
+               +chunk->chunk_index + 1, chunk->is_last_chunk ? " (LAST)" : "",
+               backend_slot, fd, chunk->len, chunk->ctx->client_id);
 
         // IMPORTANT: Do NOT modify chunk->ctx->backend_id here
         // The backend_id in the chunk was set by the backend server itself

@@ -31,8 +31,8 @@ typedef struct {
   uint32_t client_id;    // Client ID (sender or destination)
   uint32_t backend_id;   // Backend ID (sender or destination)
   uint32_t total_len;    // Total message length
-  uint32_t chunks_sent;  // Number of chunks sent so far
-  uint32_t total_chunks; // Total number of chunks for this message
+  uint32_t bytes_sent;   // Number of bytes sent/received so far
+  uint8_t complete;      // 1 if message is complete (all bytes received/sent)
   uint8_t in_use;        // 1 if this context is active
   uint64_t timestamp_ns; // Message creation timestamp
   uint32_t ctx_id;       // Unique context ID
@@ -47,6 +47,7 @@ typedef struct {
   uint32_t len;           // Actual data length in this chunk
   uint32_t capacity;      // Allocated capacity (tier size)
   uint8_t tier;           // Which tier this came from
+  uint8_t is_last_chunk;  // 1 if this is the last chunk
   uint8_t is_first_chunk; // 1 if this is the first chunk (needs header)
   uint8_t data[];         // Flexible array for data
 } chunk_t;

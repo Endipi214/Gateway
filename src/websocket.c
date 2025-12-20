@@ -277,9 +277,8 @@ chunk_t *parse_ws_chunk(int fd) {
     st->ctx->client_id = client_id;
     st->ctx->backend_id = backend_id;
     st->ctx->total_len = backend_payload_len;
-    st->ctx->chunks_sent = 0;
-    st->ctx->total_chunks =
-        (backend_payload_len + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
+    st->ctx->bytes_sent = 0;
+    st->ctx->complete = 0;
     st->ctx->timestamp_ns = get_time_ns();
 
     st->payload_read = BACKEND_HEADER_SIZE; // Mark backend header as read
@@ -288,6 +287,7 @@ chunk_t *parse_ws_chunk(int fd) {
   // Step 2: Extract data chunks from buffer
   uint32_t remaining_in_message = (st->payload_len - st->payload_read);
   if (remaining_in_message == 0) {
+    st->ctx->complete = 1;
     // Message complete - release read state's reference
     msg_context_unref(st->ctx);
     st->ctx = NULL;
@@ -331,11 +331,14 @@ chunk_t *parse_ws_chunk(int fd) {
   chunk->chunk_index = st->chunks_created;
   st->chunks_created++; // Increment AFTER assignment
   chunk->len = to_read;
+  chunk->is_last_chunk =
+      (st->payload_read + to_read >= st->payload_len) ? 1 : 0;
   chunk->is_first_chunk = (chunk->chunk_index == 0) ? 1 : 0;
   st->payload_read += to_read;
 
   // Check if message is complete
   if (st->payload_read >= st->payload_len) {
+    st->ctx->complete = 1;
     // Message complete - release read state's reference
     msg_context_unref(st->ctx);
     st->ctx = NULL;
