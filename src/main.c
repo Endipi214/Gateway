@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "backend.h"
+#include "discovery.h"
 #include "gateway.h"
 #include "mempool.h"
 #include "metrics.h"
@@ -34,6 +35,7 @@ int ws_port;
 backend_server_t backend_servers[MAX_BACKEND_SERVERS];
 int backend_server_count = 0;
 backend_conn_t backends[MAX_BACKEND_SERVERS];
+int use_discovery = 0; // NEW: Discovery mode flag
 
 // Signal handling
 void signal_handler(int sig) {
@@ -44,61 +46,77 @@ void signal_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 3) {
+  if (argc < 2) {
     fprintf(
         stderr,
-        "Usage: %s <ws_port> <backend1_host:port> [backend2_host:port] ...\n",
+        "Usage: %s <ws_port> [backend1_host:port] [backend2_host:port] ...\n",
         argv[0]);
-    fprintf(
-        stderr,
-        "Example: %s 8080 127.0.0.1:9090 127.0.0.1:9091 192.168.1.10:9090\n",
-        argv[0]);
+    fprintf(stderr, "       %s <ws_port> --discover (use UDP discovery)\n",
+            argv[0]);
+    fprintf(stderr, "Example: %s 8080 127.0.0.1:9090 127.0.0.1:9091\n",
+            argv[0]);
+    fprintf(stderr, "         %s 8080 --discover\n", argv[0]);
     return 1;
   }
 
   ws_port = atoi(argv[1]);
 
-  // Parse all backend servers
-  for (int i = 2; i < argc && backend_server_count < MAX_BACKEND_SERVERS; i++) {
-    char *colon = strchr(argv[i], ':');
-    if (!colon) {
-      fprintf(stderr, "Invalid backend format: %s (expected host:port)\n",
-              argv[i]);
-      continue;
+  // Check for discovery mode
+  if (argc >= 3 && strcmp(argv[2], "--discover") == 0) {
+    use_discovery = 1;
+    printf("[Main] Using UDP service discovery mode\n");
+  } else {
+    // Parse manual backend list
+    for (int i = 2; i < argc && backend_server_count < MAX_BACKEND_SERVERS;
+         i++) {
+      char *colon = strchr(argv[i], ':');
+      if (!colon) {
+        fprintf(stderr, "Invalid backend format: %s (expected host:port)\n",
+                argv[i]);
+        continue;
+      }
+
+      int host_len = colon - argv[i];
+      strncpy(backend_servers[backend_server_count].host, argv[i], host_len);
+      backend_servers[backend_server_count].host[host_len] = '\0';
+      backend_servers[backend_server_count].port = atoi(colon + 1);
+      backend_server_count++;
     }
 
-    int host_len = colon - argv[i];
-    strncpy(backend_servers[backend_server_count].host, argv[i], host_len);
-    backend_servers[backend_server_count].host[host_len] = '\0';
-    backend_servers[backend_server_count].port = atoi(colon + 1);
-    backend_server_count++;
+    if (backend_server_count == 0 && !use_discovery) {
+      fprintf(stderr, "Error: No valid backend servers specified\n");
+      return 1;
+    }
   }
 
-  if (backend_server_count == 0) {
-    fprintf(stderr, "Error: No valid backend servers specified\n");
-    return 1;
-  }
-
-  // NEW banner
-  printf(
-      "╔════════════════════════════════════════════════════════════════╗\n");
+  // Banner
+  printf("╔═══════════════════════════════════════════════════════════════╗\n");
   printf("║       High-Performance WebSocket Gateway (Production)         ║\n");
-  printf(
-      "╠════════════════════════════════════════════════════════════════╣\n");
+  printf("╠═══════════════════════════════════════════════════════════════╣\n");
   printf("║  WebSocket Port:    %5d                                      ║\n",
          ws_port);
-  printf("║  Backend Servers:   %d configured                             ║\n",
-         backend_server_count);
-  for (int i = 0; i < backend_server_count; i++) {
-    printf("║    [%d] %s:%-5d                                           ║\n", i,
-           backend_servers[i].host, backend_servers[i].port);
+
+  if (use_discovery) {
+    printf("║  Discovery Mode:    ENABLED (UDP port %d)                   ║\n",
+           DISCOVERY_PORT);
+    printf(
+        "║  Backend Servers:   Auto-discovery active                     ║\n");
+  } else {
+    printf(
+        "║  Backend Servers:   %d configured                             ║\n",
+        backend_server_count);
+    for (int i = 0; i < backend_server_count; i++) {
+      printf("║    [%d] %s:%-5d                                           ║\n",
+             i, backend_servers[i].host, backend_servers[i].port);
+    }
   }
+
   printf("║  Memory Pool:       %d messages                              ║\n",
          POOL_SIZE);
   printf("║  Queue Size:        %d slots each                            ║\n",
          QUEUE_SIZE);
   printf(
-      "╚════════════════════════════════════════════════════════════════╝\n\n");
+      "╚═══════════════════════════════════════════════════════════════╝\n\n");
 
   // Setup signal handlers
   signal(SIGINT, signal_handler);
@@ -110,13 +128,25 @@ int main(int argc, char **argv) {
   pool_init();
   queue_init(&q_ws_to_backend);
   queue_init(&q_backend_to_ws);
-  ws_init();      // NEW: Initialize WebSocket state arrays
-  backend_init(); // NEW: Initialize backend state arrays
+  ws_init();
+  backend_init();
+
+  // Initialize discovery if enabled
+  pthread_t t_discovery;
+  if (use_discovery) {
+    if (discovery_init() < 0) {
+      fprintf(stderr, "Failed to initialize discovery\n");
+      return 1;
+    }
+    pthread_create(&t_discovery, NULL, discovery_thread_fn, NULL);
+    printf("[Main] Discovery thread started\n");
+  }
 
   // Initialize client array
   for (int i = 0; i < MAX_CLIENTS; i++) {
     clients[i].fd = -1;
   }
+
   // Initialize backend array
   for (int i = 0; i < MAX_BACKEND_SERVERS; i++) {
     backends[i].fd = -1;
@@ -172,7 +202,8 @@ int main(int argc, char **argv) {
   pthread_t t_ws, t_backend, t_monitor;
 
   pthread_create(&t_ws, NULL, ws_thread_fn, &listen_fd);
-  pthread_create(&t_backend, NULL, backend_thread_fn, NULL);
+  pthread_create(&t_backend, NULL, backend_thread_fn,
+                 &use_discovery); // Pass discovery flag
   pthread_create(&t_monitor, NULL, monitor_thread_fn, NULL);
 
   printf("[Main] All threads started. Press Ctrl+C to stop.\n");
@@ -182,13 +213,22 @@ int main(int argc, char **argv) {
   pthread_join(t_backend, NULL);
   pthread_join(t_monitor, NULL);
 
+  // Wait for discovery thread if running
+  if (use_discovery) {
+    pthread_join(t_discovery, NULL);
+  }
+
   // Cleanup
   close(listen_fd);
   close(eventfd_ws);
   close(eventfd_backend);
   pool_cleanup();
-  ws_cleanup();      // NEW: Cleanup WebSocket state arrays
-  backend_cleanup(); // NEW: Cleanup backend state arrays
+  ws_cleanup();
+  backend_cleanup();
+
+  if (use_discovery) {
+    discovery_cleanup();
+  }
 
   printf("\n[Main] Gateway stopped cleanly.\n");
   return 0;

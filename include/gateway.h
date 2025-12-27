@@ -52,5 +52,6 @@ extern backend_conn_t backends[MAX_BACKEND_SERVERS];
 extern int ws_port;
 extern int backend_server_count;
 extern backend_server_t backend_servers[MAX_BACKEND_SERVERS];
+extern int use_discovery;
 
 #endif // __GATEWAY_H__

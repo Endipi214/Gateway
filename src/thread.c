@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "backend.h"
+#include "discovery.h"
 #include "gateway.h"
 #include "mempool.h"
 #include "metrics.h"
@@ -473,27 +474,53 @@ void *ws_thread_fn(void *arg) {
 }
 
 void *backend_thread_fn(void *arg) {
+  int use_disc = (arg != NULL) ? *((int *)arg) : 0;
+
   int epoll_fd = epoll_create1(0);
   if (epoll_fd < 0) {
     perror("epoll_create1");
     return NULL;
   }
 
-  // Add eventfd
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.fd = eventfd_backend;
   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventfd_backend, &ev);
 
-  printf("[Backend Thread] Started, connecting to %d backend servers\n",
-         backend_server_count);
+  if (use_disc) {
+    printf("[Backend Thread] Started with service discovery\n");
+  } else {
+    printf("[Backend Thread] Started, connecting to %d backend servers\n",
+           backend_server_count);
+  }
 
   struct epoll_event events[EPOLL_EVENTS];
   time_t last_reconnect = 0;
+  time_t last_discovery_check = 0; // NEW: Track discovery updates
 
   while (atomic_load_explicit(&running, memory_order_acquire)) {
-    // Attempt to connect/reconnect backends
     time_t now = time(NULL);
+
+    // NEW: Update backends from discovery every 2 seconds
+    if (use_disc && (now - last_discovery_check >= 2)) {
+      discovered_backend_t discovered[MAX_DISCOVERED_BACKENDS];
+      int count = get_discovered_backends(discovered, MAX_DISCOVERED_BACKENDS);
+
+      if (count > 0) {
+        // Update backend_servers list with discovered backends
+        backend_server_count = 0;
+        for (int i = 0; i < count && i < MAX_BACKEND_SERVERS; i++) {
+          strncpy(backend_servers[i].host, discovered[i].host,
+                  sizeof(backend_servers[i].host) - 1);
+          backend_servers[i].port = discovered[i].port;
+          backend_server_count++;
+        }
+      }
+
+      last_discovery_check = now;
+    }
+
+    // Attempt to connect/reconnect backends
     if (now - last_reconnect >= RECONNECT_INTERVAL) {
       for (int i = 0; i < backend_server_count; i++) {
         if (!atomic_load_explicit(&backends[i].connected,
@@ -507,7 +534,6 @@ void *backend_thread_fn(void *arg) {
                                   memory_order_release);
             backends[i].reconnect_count++;
 
-            // Initialize send state
             backend_pending_sends[fd % MAX_BACKENDS].in_progress = 0;
             backend_pending_sends[fd % MAX_BACKENDS].msg = NULL;
 
@@ -520,8 +546,10 @@ void *backend_thread_fn(void *arg) {
             printf("[Backend] Connected to %s:%d (fd=%d, backend_id=%d)\n",
                    backend_servers[i].host, backend_servers[i].port, fd, i + 1);
           } else {
-            printf("[Backend] Failed to connect to %s:%d (backend_id=%d)\n",
-                   backend_servers[i].host, backend_servers[i].port, i + 1);
+            if (!use_disc) { // Only log failures in manual mode
+              printf("[Backend] Failed to connect to %s:%d (backend_id=%d)\n",
+                     backend_servers[i].host, backend_servers[i].port, i + 1);
+            }
           }
         }
       }
