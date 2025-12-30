@@ -4,29 +4,35 @@
 #include "gateway.h"
 #include "mempool.h"
 
-// --------- Single-Producer Single-Consumer Queue ---------
-// This is a lock-free SPSC queue for passing messages between
-// threads or event loops. Designed for high-performance, non-blocking use.
+#define QUEUE_HIGH_WATER_THRESHOLD 0.8 // 80% full triggers backpressure
+
+// --------- Priority SPSC Queue ---------
 typedef struct {
   message_t *buffer[QUEUE_SIZE];
   atomic_uint head;
   atomic_uint tail;
   atomic_uint drops;
   atomic_uint high_water;
-} spsc_queue_t;
 
-// --------- Global SPSC Queue ---------
-extern spsc_queue_t q_ws_to_backend;
-extern spsc_queue_t q_backend_to_ws;
+  // Priority lane (25% of main queue size)
+  message_t *priority_buffer[QUEUE_SIZE / 4];
+  atomic_uint priority_head;
+  atomic_uint priority_tail;
+  atomic_uint priority_drops;
+
+  // Backpressure tracking
+  atomic_uint backpressure_events;
+} priority_spsc_queue_t;
+
+// --------- Global Queues ---------
+extern priority_spsc_queue_t q_ws_to_backend;
+extern priority_spsc_queue_t q_backend_to_ws;
 
 // --------- Queue API ---------
-// Initialize the queue
-void queue_init(spsc_queue_t *q);
-// Push a message into the queue, returns 0 if success, -1 if full
-int queue_push(spsc_queue_t *q, message_t *msg);
-// Pop a message from the queue, returns NULL if empty
-message_t *queue_pop(spsc_queue_t *q);
-// Returns the current number of messages in the queue
-uint32_t queue_depth(spsc_queue_t *q);
+void queue_init(priority_spsc_queue_t *q);
+int queue_push(priority_spsc_queue_t *q, message_t *msg, int *should_throttle);
+message_t *queue_pop(priority_spsc_queue_t *q);
+uint32_t queue_depth(priority_spsc_queue_t *q);
+float queue_utilization(priority_spsc_queue_t *q);
 
 #endif // __QUEUE_H__

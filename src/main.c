@@ -22,11 +22,9 @@
 
 int eventfd_ws;
 int eventfd_backend;
-atomic_bool running;
+atomic_bool running = ATOMIC_VAR_INIT(1);
 
 client_conn_t clients[MAX_CLIENTS];
-
-atomic_bool running = ATOMIC_VAR_INIT(1);
 
 metrics_t metrics_ws;
 metrics_t metrics_backend;
@@ -35,7 +33,7 @@ int ws_port;
 backend_server_t backend_servers[MAX_BACKEND_SERVERS];
 int backend_server_count = 0;
 backend_conn_t backends[MAX_BACKEND_SERVERS];
-int use_discovery = 0; // NEW: Discovery mode flag
+int use_discovery = 0;
 
 // Signal handling
 void signal_handler(int sig) {
@@ -115,6 +113,12 @@ int main(int argc, char **argv) {
          POOL_SIZE);
   printf("║  Queue Size:        %d slots each                            ║\n",
          QUEUE_SIZE);
+  printf("║  Priority Queue:    %d slots                                 ║\n",
+         QUEUE_SIZE / 4);
+  printf("║  Backpressure:      Enabled at %.0f%% utilization             ║\n",
+         QUEUE_HIGH_WATER_THRESHOLD * 100);
+  printf("║  Circuit Breaker:   Enabled (%d sec timeout)                 ║\n",
+         CIRCUIT_BREAKER_TIMEOUT);
   printf(
       "╚═══════════════════════════════════════════════════════════════╝\n\n");
 
@@ -142,18 +146,59 @@ int main(int argc, char **argv) {
     printf("[Main] Discovery thread started\n");
   }
 
-  // Initialize client array
+  // Initialize client array with health tracking
+  printf("[Main] Initializing client connection tracking...\n");
   for (int i = 0; i < MAX_CLIENTS; i++) {
     clients[i].fd = -1;
+    clients[i].state = 0;
+    clients[i].last_activity = 0;
+    clients[i].messages_recv = 0;
+    clients[i].messages_sent = 0;
+    clients[i].errors = 0;
+    clients[i].consecutive_send_failures = 0;
+    clients[i].connected_at = 0;
+    clients[i].bytes_recv_this_sec = 0;
+    clients[i].rate_limit_window = 0;
+    clients[i].max_bytes_per_sec = 0; // No limit by default
   }
 
-  // Initialize backend array
+  // Initialize backend array with circuit breaker
+  printf("[Main] Initializing backend connections with circuit breakers...\n");
   for (int i = 0; i < MAX_BACKEND_SERVERS; i++) {
     backends[i].fd = -1;
     atomic_store(&backends[i].connected, 0);
     backends[i].last_attempt = 0;
     backends[i].reconnect_count = 0;
+
+    // Circuit breaker initialization
+    backends[i].consecutive_failures = 0;
+    backends[i].circuit_open_until = 0;
+    backends[i].circuit_state = CB_CLOSED;
+
+    // Health tracking
+    backends[i].last_successful_send = 0;
+    backends[i].messages_sent = 0;
+    backends[i].messages_failed = 0;
   }
+
+  // Initialize metrics
+  atomic_store(&metrics_ws.messages_sent, 0);
+  atomic_store(&metrics_ws.messages_recv, 0);
+  atomic_store(&metrics_ws.bytes_sent, 0);
+  atomic_store(&metrics_ws.bytes_recv, 0);
+  atomic_store(&metrics_ws.latency_sum_ns, 0);
+  atomic_store(&metrics_ws.latency_count, 0);
+  atomic_store(&metrics_ws.connections, 0);
+  atomic_store(&metrics_ws.disconnections, 0);
+
+  atomic_store(&metrics_backend.messages_sent, 0);
+  atomic_store(&metrics_backend.messages_recv, 0);
+  atomic_store(&metrics_backend.bytes_sent, 0);
+  atomic_store(&metrics_backend.bytes_recv, 0);
+  atomic_store(&metrics_backend.latency_sum_ns, 0);
+  atomic_store(&metrics_backend.latency_count, 0);
+  atomic_store(&metrics_backend.connections, 0);
+  atomic_store(&metrics_backend.disconnections, 0);
 
   // Create eventfds
   eventfd_ws = eventfd(0, EFD_NONBLOCK);
@@ -202,11 +247,17 @@ int main(int argc, char **argv) {
   pthread_t t_ws, t_backend, t_monitor;
 
   pthread_create(&t_ws, NULL, ws_thread_fn, &listen_fd);
-  pthread_create(&t_backend, NULL, backend_thread_fn,
-                 &use_discovery); // Pass discovery flag
+  pthread_create(&t_backend, NULL, backend_thread_fn, &use_discovery);
   pthread_create(&t_monitor, NULL, monitor_thread_fn, NULL);
 
   printf("[Main] All threads started. Press Ctrl+C to stop.\n");
+  printf("[Main] Enhanced features active:\n");
+  printf("  ✓ Backpressure control\n");
+  printf("  ✓ Circuit breakers\n");
+  printf("  ✓ Health monitoring\n");
+  printf("  ✓ Priority queues\n");
+  printf("  ✓ Rate limiting\n");
+  printf("  ✓ Timeout tracking\n\n");
 
   // Wait for threads
   pthread_join(t_ws, NULL);

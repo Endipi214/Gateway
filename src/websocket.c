@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "backend.h"
@@ -19,7 +20,6 @@
 ws_state_t *ws_states = NULL;
 ws_send_state_t *ws_send_states = NULL;
 
-// Initialize WebSocket state arrays
 void ws_init(void) {
   ws_states = calloc(MAX_CLIENTS, sizeof(ws_state_t));
   ws_send_states = calloc(MAX_CLIENTS, sizeof(ws_send_state_t));
@@ -43,8 +43,34 @@ void ws_cleanup(void) {
   }
 }
 
-// API
-// Encoding for WebSocket
+void cleanup_stale_ws_sends(void) {
+  time_t now = time(NULL);
+
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    ws_send_state_t *ss = &ws_send_states[i];
+
+    if ((ss->header_sent > 0 || ss->data_sent > 0) &&
+        now - ss->start_time > WS_SEND_TIMEOUT) {
+      fprintf(stderr, "[WS] Aborting stuck send on client slot %d (timeout)\n",
+              i);
+
+      // Reset send state
+      ss->header_sent = 0;
+      ss->data_sent = 0;
+      ss->header_len = 0;
+      ss->total_len = 0;
+      ss->start_time = 0;
+      ss->retry_count = 0;
+
+      // Close the stuck connection
+      if (clients[i].fd > 0) {
+        close(clients[i].fd);
+        clients[i].fd = -1;
+      }
+    }
+  }
+}
+
 char *base64_encode(const unsigned char *input, int length) {
   BIO *bio, *b64;
   BUF_MEM *buffer_ptr;
@@ -66,7 +92,6 @@ char *base64_encode(const unsigned char *input, int length) {
   return result;
 }
 
-// WebSocket handshaking
 int handle_ws_handshake(int fd) {
   char buffer[4096];
   ssize_t n = recv(fd, buffer, sizeof(buffer) - 1, 0);
@@ -75,7 +100,6 @@ int handle_ws_handshake(int fd) {
 
   buffer[n] = '\0';
 
-  // Extract WebSocket key
   char *key_start = strstr(buffer, "Sec-WebSocket-Key: ");
   if (!key_start)
     return -1;
@@ -90,7 +114,6 @@ int handle_ws_handshake(int fd) {
   memcpy(key, key_start, key_len);
   key[key_len] = '\0';
 
-  // Generate accept key
   char concat[512];
   snprintf(concat, sizeof(concat), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
            key);
@@ -100,7 +123,6 @@ int handle_ws_handshake(int fd) {
 
   char *accept_key = base64_encode(hash, SHA_DIGEST_LENGTH);
 
-  // Send handshake response
   char response[1024];
   int len = snprintf(response, sizeof(response),
                      "HTTP/1.1 101 Switching Protocols\r\n"
@@ -118,29 +140,38 @@ int handle_ws_handshake(int fd) {
 message_t *parse_ws_backend_frame(int fd) {
   ws_state_t *st = &ws_states[fd % MAX_CLIENTS];
 
-  // Try to receive data
-  while (1) {
-    ssize_t n = recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos,
-                     MSG_DONTWAIT);
+  // Rate limit check
+  if (!check_rate_limit(fd)) {
+    errno = EAGAIN;
+    return NULL;
+  }
 
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        break;
-      }
-      st->pos = 0;
+  // Limit recv per call
+  size_t to_read = MAX_MESSAGE_SIZE - st->pos;
+  if (to_read > MAX_RECV_PER_CALL) {
+    to_read = MAX_RECV_PER_CALL;
+  }
+
+  ssize_t n = recv(fd, st->buffer + st->pos, to_read, MSG_DONTWAIT);
+
+  if (n < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return NULL;
     }
+    st->pos = 0;
+    return NULL;
+  }
 
-    if (n == 0) {
-      st->pos = 0;
-      return NULL;
-    }
+  if (n == 0) {
+    st->pos = 0;
+    return NULL;
+  }
 
-    st->pos += n;
+  st->pos += n;
 
-    if (st->pos >= 2) {
-      break;
-    }
+  // Update rate limit tracking
+  if (fd >= 0 && fd < MAX_CLIENTS) {
+    clients[fd].bytes_recv_this_sec += n;
   }
 
   if (st->pos < 2)
@@ -166,7 +197,6 @@ message_t *parse_ws_backend_frame(int fd) {
   uint64_t payload_len = mask_len & 0x7F;
   uint32_t header_size = 2;
 
-  // Extended payload length
   if (payload_len == 126) {
     if (st->pos < 4)
       return NULL;
@@ -194,19 +224,8 @@ message_t *parse_ws_backend_frame(int fd) {
   }
 
   if (st->pos < frame_size) {
-    ssize_t n = recv(fd, st->buffer + st->pos, MAX_MESSAGE_SIZE - st->pos,
-                     MSG_DONTWAIT);
-    if (n > 0) {
-      st->pos += n;
-      if (st->pos < frame_size) {
-        return NULL;
-      }
-    } else {
-      return NULL;
-    }
+    return NULL;
   }
-
-  // WebSocket payload contains: [12-byte backend header][actual payload]
 
   if (payload_len < BACKEND_HEADER_SIZE) {
     fprintf(stderr, "[WebSocket] Payload too small for backend header\n");
@@ -214,7 +233,7 @@ message_t *parse_ws_backend_frame(int fd) {
     return NULL;
   }
 
-  // Unmask the entire payload first
+  // Unmask payload
   uint8_t unmasked_payload[MAX_MESSAGE_SIZE];
   if (masked) {
     uint8_t *mask = &st->buffer[header_size - 4];
@@ -226,7 +245,7 @@ message_t *parse_ws_backend_frame(int fd) {
     memcpy(unmasked_payload, &st->buffer[header_size], payload_len);
   }
 
-  // Parse backend header from the unmasked payload
+  // Parse backend header
   uint32_t network_len, network_client_id, network_backend_id;
   memcpy(&network_len, unmasked_payload, 4);
   memcpy(&network_client_id, unmasked_payload + 4, 4);
@@ -236,14 +255,13 @@ message_t *parse_ws_backend_frame(int fd) {
   uint32_t client_id = ntohl(network_client_id);
   uint32_t backend_id = ntohl(network_backend_id);
 
-  // Validate
   if (backend_payload_len != payload_len - BACKEND_HEADER_SIZE) {
     fprintf(stderr, "[WebSocket] Backend header length mismatch\n");
     st->pos = 0;
     return NULL;
   }
 
-  // Allocate message for the actual payload (without backend header)
+  // Allocate message
   message_t *msg = msg_alloc(backend_payload_len);
   if (!msg) {
     fprintf(stderr, "[WebSocket] Failed to allocate message\n");
@@ -256,7 +274,6 @@ message_t *parse_ws_backend_frame(int fd) {
   msg->len = backend_payload_len;
   msg->timestamp_ns = get_time_ns();
 
-  // Copy actual payload data (skip backend header)
   memcpy(msg->data, unmasked_payload + BACKEND_HEADER_SIZE,
          backend_payload_len);
 
@@ -275,12 +292,12 @@ message_t *parse_ws_backend_frame(int fd) {
 int send_ws_backend_frame(int fd, message_t *msg) {
   ws_send_state_t *ss = &ws_send_states[fd % MAX_CLIENTS];
 
-  // First call for this message - initialize send state
+  // First call - initialize
   if (ss->header_sent == 0 && ss->data_sent == 0) {
-    // Total length = backend header (12 bytes) + payload
     ss->total_len = BACKEND_HEADER_SIZE + msg->len;
+    ss->start_time = time(NULL);
 
-    // Build WebSocket header for the total length
+    // Build WebSocket header
     ss->header[0] = WS_FIN | WS_OPCODE_BIN;
 
     if (ss->total_len < 126) {
@@ -301,20 +318,33 @@ int send_ws_backend_frame(int fd, message_t *msg) {
       ss->header_len = 10;
     }
 
-    // Build backend frame header (12 bytes) and append to WebSocket header
+    // Append backend header
     uint32_t network_len = htonl(msg->len);
     uint32_t network_client_id = htonl(msg->client_id);
     uint32_t network_backend_id = htonl(msg->backend_id);
 
-    // Now we have enough space - append backend header after WebSocket header
     memcpy(&ss->header[ss->header_len], &network_len, 4);
     memcpy(&ss->header[ss->header_len + 4], &network_client_id, 4);
     memcpy(&ss->header[ss->header_len + 8], &network_backend_id, 4);
 
-    ss->header_len += BACKEND_HEADER_SIZE; // Now includes both headers
+    ss->header_len += BACKEND_HEADER_SIZE;
   }
 
-  // Step 1: Send combined WebSocket + backend headers
+  // Check timeout
+  if (time(NULL) - ss->start_time > WS_SEND_TIMEOUT) {
+    ss->retry_count++;
+    if (ss->retry_count > 3) {
+      fprintf(stderr, "[WS] Send timeout on fd %d after %u retries\n", fd,
+              ss->retry_count);
+      ss->header_sent = 0;
+      ss->data_sent = 0;
+      ss->header_len = 0;
+      ss->retry_count = 0;
+      return -1;
+    }
+  }
+
+  // Send combined headers
   while (ss->header_sent < ss->header_len) {
     ssize_t sent =
         send(fd, ss->header + ss->header_sent, ss->header_len - ss->header_sent,
@@ -322,41 +352,44 @@ int send_ws_backend_frame(int fd, message_t *msg) {
 
     if (sent < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return 1; // Partial send, call again later
+        return 1;
       }
-      // Error occurred
       ss->header_sent = 0;
       ss->data_sent = 0;
+      ss->header_len = 0;
+      ss->retry_count = 0;
       return -1;
     }
 
     ss->header_sent += sent;
   }
 
-  // Step 2: Send payload data (msg->len bytes, NOT ss->total_len -
-  // BACKEND_HEADER_SIZE)
+  // Send payload
   while (ss->data_sent < msg->len) {
     ssize_t sent = send(fd, msg->data + ss->data_sent, msg->len - ss->data_sent,
                         MSG_DONTWAIT | MSG_NOSIGNAL);
 
     if (sent < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return 1; // Partial send, call again later
+        return 1;
       }
-      // Error occurred
       ss->header_sent = 0;
       ss->data_sent = 0;
+      ss->header_len = 0;
+      ss->retry_count = 0;
       return -1;
     }
 
     ss->data_sent += sent;
   }
 
-  // Complete send - reset state
+  // Complete - reset
   ss->header_sent = 0;
   ss->data_sent = 0;
   ss->header_len = 0;
   ss->total_len = 0;
+  ss->start_time = 0;
+  ss->retry_count = 0;
 
-  return 0; // Success
+  return 0;
 }

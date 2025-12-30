@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "backend.h"
@@ -16,7 +17,6 @@
 backend_state_t *backend_states = NULL;
 backend_send_state_t *backend_send_states = NULL;
 
-// Initialize backend state arrays
 void backend_init(void) {
   backend_states = calloc(MAX_BACKENDS, sizeof(backend_state_t));
   backend_send_states = calloc(MAX_BACKENDS, sizeof(backend_send_state_t));
@@ -40,17 +40,71 @@ void backend_cleanup(void) {
   }
 }
 
-// Backend protocol API
+void cleanup_stale_backend_sends(void) {
+  time_t now = time(NULL);
+
+  for (int i = 0; i < MAX_BACKENDS; i++) {
+    backend_send_state_t *ss = &backend_send_states[i];
+
+    if ((ss->header_sent > 0 || ss->data_sent > 0) &&
+        now - ss->start_time > BACKEND_SEND_TIMEOUT) {
+      fprintf(stderr,
+              "[Backend] Aborting stuck send on backend slot %d (timeout)\n",
+              i);
+
+      ss->header_sent = 0;
+      ss->data_sent = 0;
+      ss->total_len = 0;
+      ss->start_time = 0;
+      ss->retry_count = 0;
+    }
+  }
+}
+
+int check_backend_rate_limit(int fd) {
+  if (fd < 0)
+    return 0;
+
+  backend_state_t *st = &backend_states[fd % MAX_BACKENDS];
+
+  if (st->max_bytes_per_sec == 0)
+    return 1;
+
+  time_t now = time(NULL);
+
+  if (now != st->rate_limit_window) {
+    st->rate_limit_window = now;
+    st->bytes_recv_this_sec = 0;
+  }
+
+  if (st->bytes_recv_this_sec >= st->max_bytes_per_sec) {
+    return 0;
+  }
+
+  return 1;
+}
+
 message_t *read_backend_frame(int fd) {
   backend_state_t *st = &backend_states[fd % MAX_BACKENDS];
 
-  // Try to receive data - loop to handle multiple recv calls for fragmented
-  // data
+  // Check rate limit
+  if (!check_backend_rate_limit(fd)) {
+    errno = EAGAIN;
+    return NULL;
+  }
+
+  // Step 1: Try to read ALL available data (loop until EAGAIN)
+  // This is CRITICAL for edge-triggered epoll (EPOLLET)
+  int total_read_this_call = 0;
+
   while (1) {
     size_t space_available = sizeof(st->buffer) - st->pos;
+
     if (space_available == 0) {
-      // Buffer full but frame not complete - this is an error
-      fprintf(stderr, "[Backend] Buffer overflow on fd %d, resetting\n", fd);
+      fprintf(stderr,
+              "[Backend] Buffer full on fd %d (pos=%u), likely invalid frame - "
+              "resetting\n",
+              fd, st->pos);
       st->pos = 0;
       st->expected_len = 0;
       st->client_id = 0;
@@ -59,23 +113,38 @@ message_t *read_backend_frame(int fd) {
       return NULL;
     }
 
-    ssize_t n = recv(fd, st->buffer + st->pos, space_available, MSG_DONTWAIT);
+    size_t to_read = (space_available < MAX_RECV_PER_CALL) ? space_available
+                                                           : MAX_RECV_PER_CALL;
+
+    ssize_t n = recv(fd, st->buffer + st->pos, to_read, MSG_DONTWAIT);
 
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        break; // No more data available right now
+        // No more data available right now - this is normal!
+        // If we have partial frame, just wait for next epoll event
+        // Don't change errno - it's already EAGAIN
+
+        // If we read some data this call, continue to parsing
+        if (total_read_this_call > 0) {
+          break; // Exit read loop, try to parse what we have
+        }
+        return NULL; // No new data at all
       }
       // Real error - reset state
+      fprintf(stderr, "[Backend] recv error on fd %d: %s\n", fd,
+              strerror(errno));
       st->pos = 0;
       st->expected_len = 0;
       st->client_id = 0;
       st->backend_id = 0;
       st->header_complete = 0;
+      // errno is already set by recv(), keep it
       return NULL;
     }
 
     if (n == 0) {
-      // Connection closed - reset state
+      // Connection closed by peer
+      fprintf(stderr, "[Backend] Connection closed by peer on fd %d\n", fd);
       st->pos = 0;
       st->expected_len = 0;
       st->client_id = 0;
@@ -85,24 +154,28 @@ message_t *read_backend_frame(int fd) {
     }
 
     st->pos += n;
-  }
+    st->bytes_recv_this_sec += n;
+    total_read_this_call += n;
 
-  // Step 1: Read header (12 bytes: 4 len + 4 client_id + 4 backend_id)
-  if (!st->header_complete) {
-    if (st->pos < BACKEND_HEADER_SIZE) {
-      // Need more header data - try one more recv
-      ssize_t n = recv(fd, st->buffer + st->pos, BACKEND_HEADER_SIZE - st->pos,
-                       MSG_DONTWAIT);
-      if (n > 0) {
-        st->pos += n;
-      }
-
-      if (st->pos < BACKEND_HEADER_SIZE) {
-        return NULL; // Still don't have full header
+    // If we know the frame size and have it all, stop reading
+    if (st->header_complete) {
+      uint32_t total_needed = BACKEND_HEADER_SIZE + st->expected_len;
+      if (st->pos >= total_needed) {
+        break; // We have complete frame, stop reading
       }
     }
 
-    // Parse header
+    // Continue loop to read more data
+  }
+
+  // Step 2: Parse header if not complete
+  if (!st->header_complete) {
+    if (st->pos < BACKEND_HEADER_SIZE) {
+      // Need more data for header
+      errno = EAGAIN; // CRITICAL: Not an error, just incomplete
+      return NULL;
+    }
+
     uint32_t network_len, network_client_id, network_backend_id;
     memcpy(&network_len, st->buffer, 4);
     memcpy(&network_client_id, st->buffer + 4, 4);
@@ -113,11 +186,10 @@ message_t *read_backend_frame(int fd) {
     st->backend_id = ntohl(network_backend_id);
     st->header_complete = 1;
 
-    // Validate length
+    // Validate payload length
     if (st->expected_len > MAX_MESSAGE_SIZE) {
-      fprintf(stderr, "[Backend] Invalid frame length: %u (max: %u)\n",
-              st->expected_len, MAX_MESSAGE_SIZE);
-      // Invalid frame, reset state
+      fprintf(stderr, "[Backend] Invalid frame length: %u (max: %u) on fd %d\n",
+              st->expected_len, MAX_MESSAGE_SIZE, fd);
       st->pos = 0;
       st->expected_len = 0;
       st->client_id = 0;
@@ -125,65 +197,39 @@ message_t *read_backend_frame(int fd) {
       st->header_complete = 0;
       return NULL;
     }
+
+    printf("[Backend] Frame header parsed: len=%u, client_id=%u, backend_id=%u "
+           "(fd=%d)\n",
+           st->expected_len, st->client_id, st->backend_id, fd);
   }
 
-  // Step 2: Read payload
+  // Step 3: Check if we have complete frame
   uint32_t total_frame_size = BACKEND_HEADER_SIZE + st->expected_len;
 
   if (st->pos < total_frame_size) {
-    // Need more payload data - try to read more
-    while (st->pos < total_frame_size) {
-      size_t needed = total_frame_size - st->pos;
-      size_t space = sizeof(st->buffer) - st->pos;
-      size_t to_read = (needed < space) ? needed : space;
+    // Need more data - calculate how much we're missing
+    uint32_t missing = total_frame_size - st->pos;
 
-      ssize_t n = recv(fd, st->buffer + st->pos, to_read, MSG_DONTWAIT);
-
-      if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          return NULL; // No more data available, frame incomplete
-        }
-        // Real error - reset state
-        st->pos = 0;
-        st->expected_len = 0;
-        st->client_id = 0;
-        st->backend_id = 0;
-        st->header_complete = 0;
-        return NULL;
-      }
-
-      if (n == 0) {
-        // Connection closed mid-frame - reset state
-        st->pos = 0;
-        st->expected_len = 0;
-        st->client_id = 0;
-        st->backend_id = 0;
-        st->header_complete = 0;
-        return NULL;
-      }
-
-      st->pos += n;
-
-      if (n < (ssize_t)to_read) {
-        // Didn't get all requested data, would block on next recv
-        break;
-      }
+    // Only log large frames to avoid spam
+    if (st->expected_len > 65536) {
+      printf("[Backend] Large frame in progress: %u/%u bytes received (%.1f%%) "
+             "on fd %d\n",
+             st->pos, total_frame_size, (float)st->pos / total_frame_size * 100,
+             fd);
     }
 
-    // Check if we have complete frame now
-    if (st->pos < total_frame_size) {
-      return NULL; // Still incomplete
-    }
+    // CRITICAL: Set errno so caller knows this is NOT an error
+    errno = EAGAIN;
+    return NULL; // Wait for more data
   }
 
-  // At this point we have a complete frame
-  // Allocate message
+  // Step 4: We have complete frame - allocate and copy
   message_t *msg = msg_alloc(st->expected_len);
   if (!msg) {
-    // Allocation failed, drop frame and reset
-    fprintf(stderr,
-            "[Backend] Failed to allocate message for %u byte payload\n",
-            st->expected_len);
+    fprintf(
+        stderr,
+        "[Backend] Failed to allocate message for %u byte payload on fd %d\n",
+        st->expected_len, fd);
     st->pos = 0;
     st->expected_len = 0;
     st->client_id = 0;
@@ -197,15 +243,18 @@ message_t *read_backend_frame(int fd) {
   msg->len = st->expected_len;
   msg->timestamp_ns = get_time_ns();
 
-  // Copy payload data
   memcpy(msg->data, st->buffer + BACKEND_HEADER_SIZE, st->expected_len);
 
-  // Handle remaining data in buffer (next frame if any)
-  uint32_t frame_size = BACKEND_HEADER_SIZE + st->expected_len;
-  if (st->pos > frame_size) {
-    uint32_t remaining = st->pos - frame_size;
-    memmove(st->buffer, st->buffer + frame_size, remaining);
+  printf("[Backend] Complete frame received: %u bytes on fd %d\n",
+         st->expected_len, fd);
+
+  // Step 5: Handle remaining data in buffer (next frame if any)
+  if (st->pos > total_frame_size) {
+    uint32_t remaining = st->pos - total_frame_size;
+    memmove(st->buffer, st->buffer + total_frame_size, remaining);
     st->pos = remaining;
+    printf("[Backend] %u bytes remaining in buffer (next frame?) on fd %d\n",
+           remaining, fd);
   } else {
     st->pos = 0;
   }
@@ -223,11 +272,11 @@ int write_backend_frame(int fd, message_t *msg, uint32_t client_id,
                         uint32_t backend_id) {
   backend_send_state_t *ss = &backend_send_states[fd % MAX_BACKENDS];
 
-  // First call for this message - initialize send state
+  // First call - initialize
   if (ss->header_sent == 0 && ss->data_sent == 0) {
     ss->total_len = msg->len;
+    ss->start_time = time(NULL);
 
-    // Prepare header: [4 bytes len][4 bytes client_id][4 bytes backend_id]
     uint32_t network_len = htonl(msg->len);
     uint32_t network_client_id = htonl(client_id);
     uint32_t network_backend_id = htonl(backend_id);
@@ -236,7 +285,20 @@ int write_backend_frame(int fd, message_t *msg, uint32_t client_id,
     memcpy(ss->header + 8, &network_backend_id, 4);
   }
 
-  // Step 1: Send header if not complete
+  // Check timeout
+  if (time(NULL) - ss->start_time > BACKEND_SEND_TIMEOUT) {
+    ss->retry_count++;
+    if (ss->retry_count > 3) {
+      fprintf(stderr, "[Backend] Send timeout on fd %d after %u retries\n", fd,
+              ss->retry_count);
+      ss->header_sent = 0;
+      ss->data_sent = 0;
+      ss->retry_count = 0;
+      return -1;
+    }
+  }
+
+  // Send header
   while (ss->header_sent < BACKEND_HEADER_SIZE) {
     ssize_t sent = send(fd, ss->header + ss->header_sent,
                         BACKEND_HEADER_SIZE - ss->header_sent,
@@ -244,18 +306,18 @@ int write_backend_frame(int fd, message_t *msg, uint32_t client_id,
 
     if (sent < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return 1; // Partial send, call again later
+        return 1;
       }
-      // Error occurred
       ss->header_sent = 0;
       ss->data_sent = 0;
+      ss->retry_count = 0;
       return -1;
     }
 
     ss->header_sent += sent;
   }
 
-  // Step 2: Send payload data
+  // Send payload
   while (ss->data_sent < ss->total_len) {
     ssize_t sent =
         send(fd, msg->data + ss->data_sent, ss->total_len - ss->data_sent,
@@ -263,23 +325,25 @@ int write_backend_frame(int fd, message_t *msg, uint32_t client_id,
 
     if (sent < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return 1; // Partial send, call again later
+        return 1;
       }
-      // Error occurred
       ss->header_sent = 0;
       ss->data_sent = 0;
+      ss->retry_count = 0;
       return -1;
     }
 
     ss->data_sent += sent;
   }
 
-  // Complete send - reset state
+  // Complete - reset
   ss->header_sent = 0;
   ss->data_sent = 0;
   ss->total_len = 0;
+  ss->start_time = 0;
+  ss->retry_count = 0;
 
-  return 0; // Success
+  return 0;
 }
 
 int connect_to_backend(const char *host, int port) {

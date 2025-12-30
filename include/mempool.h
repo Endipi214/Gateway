@@ -26,27 +26,35 @@
 // Maximum message size supported
 #define MAX_MESSAGE_SIZE TIER_5_SIZE
 
+// Message priority levels
+#define MSG_PRIORITY_LOW 0
+#define MSG_PRIORITY_NORMAL 1
+#define MSG_PRIORITY_HIGH 2
+#define MSG_PRIORITY_CRITICAL 3
+
 // --------- Message Structure ---------
-// Variable-size message structure
 typedef struct {
-  uint32_t client_id;  // Client ID (sender or destination)
-  uint32_t backend_id; // Backend ID (sender or destination)
-  uint32_t len;        // Actual data length
-  uint32_t capacity;   // Allocated capacity (tier size)
-  uint8_t tier;        // Which tier this came from
+  uint32_t client_id;
+  uint32_t backend_id;
+  uint32_t len;
+  uint32_t capacity;
+  uint8_t tier;
+  uint8_t priority;
+  uint8_t drop_if_full;
+  uint8_t retries;
   uint64_t timestamp_ns;
   uint8_t data[];
 } message_t;
 
 // --------- Tier Structure ---------
 typedef struct {
-  void *pool;                 // Base pointer to memory block
-  atomic_uint *free_stack;    // Stack of free indices
-  atomic_uint free_count;     // Number of free slots
-  atomic_uint alloc_failures; // Failed allocations
-  uint32_t slot_size;         // Size of each slot (including header)
-  uint32_t slot_count;        // Total number of slots
-  uint32_t data_size;         // Data capacity per slot
+  void *pool;
+  atomic_uint *free_stack;
+  atomic_uint free_count;
+  atomic_uint alloc_failures;
+  uint32_t slot_size;
+  uint32_t slot_count;
+  uint32_t data_size;
 } tier_pool_t;
 
 // --------- Global Tiered Memory Pool ---------
@@ -60,21 +68,13 @@ typedef struct {
 extern tiered_mem_pool_t g_tiered_pool;
 
 // --------- Memory Pool API ---------
-// Initialize the tiered memory pool
 void pool_init(void);
-
-// Allocate a message with at least 'size' bytes of data capacity
-// Returns NULL if allocation fails
 message_t *msg_alloc(uint32_t size);
-
-// Free a message back to its tier
+message_t *msg_alloc_priority(uint32_t size, uint8_t priority,
+                              uint8_t drop_if_full);
 void msg_free(message_t *msg);
-
-// Get statistics for a specific tier
 void pool_get_tier_stats(uint8_t tier, uint32_t *free, uint32_t *total,
                          uint64_t *allocs, uint32_t *failures);
-
-// Cleanup
 void pool_cleanup(void);
 
 #endif // __MEMPOOL_H__
