@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -138,44 +139,62 @@ int handle_ws_handshake(int fd) {
 }
 
 message_t *parse_ws_backend_frame(int fd) {
-  ws_state_t *st = &ws_states[fd % MAX_CLIENTS];
+  // Safety checks
+  if (!ws_states || fd < 0 || fd >= MAX_CLIENTS) {
+    errno = EINVAL;
+    return NULL;
+  }
 
-  // Rate limit check
-  if (!check_rate_limit(fd)) {
+  ws_state_t *st = &ws_states[fd];
+
+  // 1. Try to read MORE data if we don't have enough for a frame
+  // Loop recv until EAGAIN - Critical for EPOLLET
+  while (1) {
+    // Rate limit check
+    if (!check_rate_limit(fd)) {
+      errno = EAGAIN;
+      break;
+    }
+
+    size_t to_read = MAX_MESSAGE_SIZE - st->pos;
+    if (to_read == 0) {
+      fprintf(stderr, "[WebSocket] Buffer full for client %d, resetting\n", fd);
+      st->pos = 0;
+      return NULL;
+    }
+
+    if (to_read > MAX_RECV_PER_CALL) {
+      to_read = MAX_RECV_PER_CALL;
+    }
+
+    ssize_t n = recv(fd, st->buffer + st->pos, to_read, MSG_DONTWAIT);
+
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break; // Drained OS buffer
+      }
+      st->pos = 0;
+      return NULL;
+    }
+
+    if (n == 0) {
+      // Socket closed
+      st->pos = 0;
+      return NULL;
+    }
+
+    st->pos += n;
+    clients[fd].bytes_recv_this_sec += n;
+
+    // Safety: if we have enough for a header, we can check if we have enough for the frame
+    // but continuing to read until EAGAIN is actually faster/better for ET.
+  }
+
+  // 2. Parse frame from current buffer
+  if (st->pos < 2) {
     errno = EAGAIN;
     return NULL;
   }
-
-  // Limit recv per call
-  size_t to_read = MAX_MESSAGE_SIZE - st->pos;
-  if (to_read > MAX_RECV_PER_CALL) {
-    to_read = MAX_RECV_PER_CALL;
-  }
-
-  ssize_t n = recv(fd, st->buffer + st->pos, to_read, MSG_DONTWAIT);
-
-  if (n < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return NULL;
-    }
-    st->pos = 0;
-    return NULL;
-  }
-
-  if (n == 0) {
-    st->pos = 0;
-    return NULL;
-  }
-
-  st->pos += n;
-
-  // Update rate limit tracking
-  if (fd >= 0 && fd < MAX_CLIENTS) {
-    clients[fd].bytes_recv_this_sec += n;
-  }
-
-  if (st->pos < 2)
-    return NULL;
 
   uint8_t fin_opcode = st->buffer[0];
   uint8_t mask_len = st->buffer[1];
@@ -186,25 +205,20 @@ message_t *parse_ws_backend_frame(int fd) {
     return NULL;
   }
 
-  if (!(fin_opcode & WS_FIN)) {
-    if (st->pos >= MAX_MESSAGE_SIZE - 1024) {
-      st->pos = 0;
-    }
-    return NULL;
-  }
+  // We only support single-frame messages or final frames for now
+  // In a real impl, we'd need to reassemble fragmented messages.
+  // Given the backend protocol uses its own framing, we usually get one WS frame per backend message.
 
   int masked = mask_len & WS_MASK;
   uint64_t payload_len = mask_len & 0x7F;
   uint32_t header_size = 2;
 
   if (payload_len == 126) {
-    if (st->pos < 4)
-      return NULL;
+    if (st->pos < 4) { errno = EAGAIN; return NULL; }
     payload_len = (st->buffer[2] << 8) | st->buffer[3];
     header_size = 4;
   } else if (payload_len == 127) {
-    if (st->pos < 10)
-      return NULL;
+    if (st->pos < 10) { errno = EAGAIN; return NULL; }
     payload_len = 0;
     for (int i = 0; i < 8; i++) {
       payload_len = (payload_len << 8) | st->buffer[2 + i];
@@ -224,25 +238,33 @@ message_t *parse_ws_backend_frame(int fd) {
   }
 
   if (st->pos < frame_size) {
+    errno = EAGAIN;
     return NULL;
   }
 
   if (payload_len < BACKEND_HEADER_SIZE) {
     fprintf(stderr, "[WebSocket] Payload too small for backend header\n");
-    st->pos = 0;
+    // Clear the bad frame
+    if (st->pos > frame_size) {
+      memmove(st->buffer, st->buffer + frame_size, st->pos - frame_size);
+      st->pos -= frame_size;
+    } else {
+      st->pos = 0;
+    }
     return NULL;
   }
 
-  // Unmask payload
-  uint8_t unmasked_payload[MAX_MESSAGE_SIZE];
+  // Unmask payload in-place
+  uint8_t *unmasked_payload;
   if (masked) {
     uint8_t *mask = &st->buffer[header_size - 4];
     uint8_t *payload = &st->buffer[header_size];
     for (uint64_t i = 0; i < payload_len; i++) {
-      unmasked_payload[i] = payload[i] ^ mask[i % 4];
+      payload[i] = payload[i] ^ mask[i % 4];
     }
+    unmasked_payload = payload;
   } else {
-    memcpy(unmasked_payload, &st->buffer[header_size], payload_len);
+    unmasked_payload = &st->buffer[header_size];
   }
 
   // Parse backend header
@@ -256,8 +278,15 @@ message_t *parse_ws_backend_frame(int fd) {
   uint32_t backend_id = ntohl(network_backend_id);
 
   if (backend_payload_len != payload_len - BACKEND_HEADER_SIZE) {
-    fprintf(stderr, "[WebSocket] Backend header length mismatch\n");
-    st->pos = 0;
+    fprintf(stderr, "[WebSocket] Backend header length mismatch: expect %u, got %lu\n",
+            backend_payload_len, payload_len - BACKEND_HEADER_SIZE);
+    // Clear bad data
+    if (st->pos > frame_size) {
+      memmove(st->buffer, st->buffer + frame_size, st->pos - frame_size);
+      st->pos -= frame_size;
+    } else {
+      st->pos = 0;
+    }
     return NULL;
   }
 
@@ -290,7 +319,12 @@ message_t *parse_ws_backend_frame(int fd) {
 }
 
 int send_ws_backend_frame(int fd, message_t *msg) {
-  ws_send_state_t *ss = &ws_send_states[fd % MAX_CLIENTS];
+  // Safety check
+  if (!ws_send_states || fd < 0 || fd >= MAX_CLIENTS) {
+    return -1;
+  }
+
+  ws_send_state_t *ss = &ws_send_states[fd];
 
   // First call - initialize
   if (ss->header_sent == 0 && ss->data_sent == 0) {
@@ -334,8 +368,6 @@ int send_ws_backend_frame(int fd, message_t *msg) {
   if (time(NULL) - ss->start_time > WS_SEND_TIMEOUT) {
     ss->retry_count++;
     if (ss->retry_count > 3) {
-      fprintf(stderr, "[WS] Send timeout on fd %d after %u retries\n", fd,
-              ss->retry_count);
       ss->header_sent = 0;
       ss->data_sent = 0;
       ss->header_len = 0;
@@ -344,11 +376,26 @@ int send_ws_backend_frame(int fd, message_t *msg) {
     }
   }
 
-  // Send combined headers
-  while (ss->header_sent < ss->header_len) {
-    ssize_t sent =
-        send(fd, ss->header + ss->header_sent, ss->header_len - ss->header_sent,
-             MSG_DONTWAIT | MSG_NOSIGNAL);
+  // Optimized Linux Send: Use writev to send header and data in one syscall if possible
+  while (ss->header_sent < ss->header_len || ss->data_sent < msg->len) {
+    struct iovec iov[2];
+    int iovcnt = 0;
+
+    if (ss->header_sent < ss->header_len) {
+      iov[iovcnt].iov_base = ss->header + ss->header_sent;
+      iov[iovcnt].iov_len = ss->header_len - ss->header_sent;
+      iovcnt++;
+    }
+
+    if (ss->data_sent < msg->len) {
+      iov[iovcnt].iov_base = msg->data + ss->data_sent;
+      iov[iovcnt].iov_len = msg->len - ss->data_sent;
+      iovcnt++;
+    }
+
+    if (iovcnt == 0) break;
+
+    ssize_t sent = writev(fd, iov, iovcnt);
 
     if (sent < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -361,26 +408,23 @@ int send_ws_backend_frame(int fd, message_t *msg) {
       return -1;
     }
 
-    ss->header_sent += sent;
-  }
+    // Distribute 'sent' bytes between header and data
+    size_t remaining = (size_t)sent;
 
-  // Send payload
-  while (ss->data_sent < msg->len) {
-    ssize_t sent = send(fd, msg->data + ss->data_sent, msg->len - ss->data_sent,
-                        MSG_DONTWAIT | MSG_NOSIGNAL);
-
-    if (sent < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return 1;
+    if (ss->header_sent < ss->header_len) {
+      size_t header_to_ack = ss->header_len - ss->header_sent;
+      if (remaining >= header_to_ack) {
+        remaining -= header_to_ack;
+        ss->header_sent = ss->header_len;
+      } else {
+        ss->header_sent += remaining;
+        remaining = 0;
       }
-      ss->header_sent = 0;
-      ss->data_sent = 0;
-      ss->header_len = 0;
-      ss->retry_count = 0;
-      return -1;
     }
 
-    ss->data_sent += sent;
+    if (remaining > 0 && ss->data_sent < msg->len) {
+      ss->data_sent += remaining;
+    }
   }
 
   // Complete - reset

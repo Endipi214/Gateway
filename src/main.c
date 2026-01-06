@@ -44,6 +44,9 @@ void signal_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
+  setbuf(stdout, NULL); // Disable buffering to see logs immediately
+  setbuf(stderr, NULL);
+
   if (argc < 2) {
     fprintf(
         stderr,
@@ -165,8 +168,10 @@ int main(int argc, char **argv) {
   // Initialize backend array with circuit breaker
   printf("[Main] Initializing backend connections with circuit breakers...\n");
   for (int i = 0; i < MAX_BACKEND_SERVERS; i++) {
-    backends[i].fd = -1;
+    backends[i].control_fd = -1;
+    backends[i].data_fd = -1;
     atomic_store(&backends[i].connected, 0);
+    atomic_store(&backends[i].is_verified, 0); // Added
     backends[i].last_attempt = 0;
     backends[i].reconnect_count = 0;
 

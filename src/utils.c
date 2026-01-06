@@ -28,10 +28,14 @@ int set_tcp_nodelay(int fd) {
 
 void signal_eventfd(int efd) {
   uint64_t val = 1;
-  write(efd, &val, sizeof(val));
+  if (write(efd, &val, sizeof(val)) < 0) {
+      // safe to ignore in this context or log if critical
+  }
 }
 
 void drain_eventfd(int efd) {
   uint64_t val;
-  read(efd, &val, sizeof(val));
+  if (read(efd, &val, sizeof(val)) < 0) {
+      // safe to ignore
+  }
 }

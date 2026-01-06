@@ -87,7 +87,7 @@ void *discovery_thread_fn(void *arg) {
       continue;
     }
 
-    if (recv_len != sizeof(discovery_packet_t)) {
+    if (recv_len < sizeof(discovery_packet_t)) {
       continue;
     }
 
@@ -95,11 +95,19 @@ void *discovery_thread_fn(void *arg) {
       continue;
     }
 
-    char host[INET_ADDRSTRLEN];
+    char host[256]; // Increased from INET_ADDRSTRLEN
     inet_ntop(AF_INET, &sender_addr.sin_addr, host, sizeof(host));
-    int port = ntohl(packet.service_port);
 
-    packet.service_name[63] = '\0';
+    // Check for advertised hostname (Docker NAT fix)
+    packet.advertised_hostname[63] = '\0';
+    if (packet.advertised_hostname[0] != '\0') {
+         // Only use if it looks valid (simple check)
+         strncpy(host, packet.advertised_hostname, sizeof(host) - 1);
+         host[sizeof(host)-1] = '\0';
+    }
+
+    int port = ntohs(packet.service_port);
+    // packet.service_name removed from protocol
 
     time_t now = time(NULL);
 
@@ -124,12 +132,11 @@ void *discovery_thread_fn(void *arg) {
                   sizeof(discovered_backends[i].host) - 1);
           discovered_backends[i].port = port;
           discovered_backends[i].last_seen = now;
-          strncpy(discovered_backends[i].service_name, packet.service_name,
+          strncpy(discovered_backends[i].service_name, "Universal Agent",
                   sizeof(discovered_backends[i].service_name) - 1);
           discovered_backends[i].active = 1;
 
-          printf("[Discovery] New backend discovered: %s:%d (%s)\n", host, port,
-                 packet.service_name);
+          printf("[Discovery] New backend discovered: %s:%d\n", host, port);
           break;
         }
       }

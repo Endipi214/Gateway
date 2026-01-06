@@ -5,18 +5,16 @@
 #include <time.h>
 
 #define DISCOVERY_PORT 9999
-#define DISCOVERY_MAGIC 0x47415445 // "GATE" in hex
+#define DISCOVERY_MAGIC 0xCAFE1234 // Matched to BackendServer
 #define MAX_DISCOVERED_BACKENDS 16
 #define DISCOVERY_INTERVAL 5
 #define BACKEND_TIMEOUT 15
 
-// Discovery packet format
+// Discovery packet format (Matched to BackendServer.cpp)
 typedef struct {
   uint32_t magic;
-  uint32_t version;
-  uint32_t service_port;
-  char service_name[64];
-  uint32_t capabilities;
+  uint16_t service_port;
+  char advertised_hostname[64];
 } __attribute__((packed)) discovery_packet_t;
 
 // Discovered backend info

@@ -1,4 +1,4 @@
-#include "queue.h"
+#include "../include/queue.h"
 #include <stdio.h>
 
 priority_spsc_queue_t q_ws_to_backend;

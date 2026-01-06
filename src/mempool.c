@@ -140,6 +140,9 @@ message_t *msg_alloc_priority(uint32_t size, uint8_t priority,
       atomic_fetch_add_explicit(&g_tiered_pool.tier_allocs[tier_idx], 1,
                                 memory_order_relaxed);
 
+      // FIX BUG #1: Zero out the data buffer for security and to avoid log corruption
+      memset(msg->data, 0, tier->data_size);
+
       return msg;
     }
   }

@@ -1,4 +1,5 @@
 #include "gateway.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
@@ -63,32 +64,52 @@ void record_backend_success(int slot) {
   }
 }
 
-// Connection health monitoring
+// Connection health monitoring - Periodic Status (every 10s)
 void check_connection_health(void) {
   time_t now = time(NULL);
 
+  // Count active frontends
+  int frontend_count = 0;
   for (int i = 0; i < MAX_CLIENTS; i++) {
     if (clients[i].fd > 0) {
+      frontend_count++;
+
       // Check idle timeout
       if (now - clients[i].last_activity > IDLE_TIMEOUT_SEC) {
-        fprintf(
-            stderr,
-            "[Health] Client fd=%d idle timeout (last activity: %ld sec ago)\n",
-            clients[i].fd, now - clients[i].last_activity);
+        printf("[STATUS] Frontend #%d: TIMEOUT (idle %lds), disconnecting\n",
+               i, now - clients[i].last_activity);
         close(clients[i].fd);
         clients[i].fd = -1;
+        frontend_count--;
         continue;
       }
 
       // Check too many consecutive failures
       if (clients[i].consecutive_send_failures >= MAX_CONSECUTIVE_FAILURES) {
-        fprintf(stderr, "[Health] Client fd=%d too many failures (%u)\n",
-                clients[i].fd, clients[i].consecutive_send_failures);
+        printf("[STATUS] Frontend #%d: TOO MANY FAILURES (%u), disconnecting\n",
+               i, clients[i].consecutive_send_failures);
         close(clients[i].fd);
         clients[i].fd = -1;
+        frontend_count--;
         continue;
       }
     }
+  }
+
+  // Count active backends
+  int backend_count = 0;
+  for (int i = 0; i < MAX_BACKENDS; i++) {
+    if (atomic_load(&backends[i].connected)) {
+      backend_count++;
+    }
+  }
+
+  // Print summary status
+  if (frontend_count > 0 || backend_count > 0) {
+    printf("\n[Gateway Status] %lds uptime | 🌐 %d Frontends | 💻 %d Backends\n",
+           now - (time_t)0, frontend_count, backend_count);
+  } else {
+    printf("[Gateway Status] Idle (No connections)\n");
   }
 }
 

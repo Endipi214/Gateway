@@ -7,7 +7,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
+#include <netdb.h>
 
 #include "backend.h"
 #include "gateway.h"
@@ -198,9 +200,7 @@ message_t *read_backend_frame(int fd) {
       return NULL;
     }
 
-    printf("[Backend] Frame header parsed: len=%u, client_id=%u, backend_id=%u "
-           "(fd=%d)\n",
-           st->expected_len, st->client_id, st->backend_id, fd);
+    // printf("[Backend] Frame header parsed: len=%u, client_id=%u, backend_id=%u (fd=%d)\n", st->expected_len, st->client_id, st->backend_id, fd);
   }
 
   // Step 3: Check if we have complete frame
@@ -211,12 +211,15 @@ message_t *read_backend_frame(int fd) {
     uint32_t missing = total_frame_size - st->pos;
 
     // Only log large frames to avoid spam
+    // Only log large frames to avoid spam
+    /*
     if (st->expected_len > 65536) {
       printf("[Backend] Large frame in progress: %u/%u bytes received (%.1f%%) "
              "on fd %d\n",
              st->pos, total_frame_size, (float)st->pos / total_frame_size * 100,
              fd);
     }
+    */
 
     // CRITICAL: Set errno so caller knows this is NOT an error
     errno = EAGAIN;
@@ -245,16 +248,37 @@ message_t *read_backend_frame(int fd) {
 
   memcpy(msg->data, st->buffer + BACKEND_HEADER_SIZE, st->expected_len);
 
-  printf("[Backend] Complete frame received: %u bytes on fd %d\n",
-         st->expected_len, fd);
+  // --- PRIORITY CLASSIFICATION ---
+  // Updated for Flow Control: Check first byte for Traffic Class
+  if (msg->len > 0) {
+      uint8_t traffic_class = ((uint8_t*)msg->data)[0];
+
+      if (traffic_class == TRAFFIC_CONTROL) {
+          msg->priority = MSG_PRIORITY_HIGH;
+
+          // DIAGNOSTIC (Optional): Log Critical Messages
+          /*
+          if (msg->len > 1 && msg->len < 200) {
+              struct timeval tv;
+              gettimeofday(&tv, NULL);
+              long long ms = tv.tv_sec*1000LL + tv.tv_usec/1000;
+              // Skip 0x01 prefix for printing
+              printf("[GW-BackEnd-HighPrio] %.*s at %lld\n", msg->len-1, (char*)msg->data+1, ms);
+          }
+          */
+      } else {
+          msg->priority = MSG_PRIORITY_NORMAL;
+      }
+  }
+
+  // printf("[Backend] Complete frame received: %u bytes on fd %d\n", st->expected_len, fd);
 
   // Step 5: Handle remaining data in buffer (next frame if any)
   if (st->pos > total_frame_size) {
     uint32_t remaining = st->pos - total_frame_size;
     memmove(st->buffer, st->buffer + total_frame_size, remaining);
     st->pos = remaining;
-    printf("[Backend] %u bytes remaining in buffer (next frame?) on fd %d\n",
-           remaining, fd);
+    // printf("[Backend] %u bytes remaining in buffer (next frame?) on fd %d\n", remaining, fd);
   } else {
     st->pos = 0;
   }
@@ -347,20 +371,36 @@ int write_backend_frame(int fd, message_t *msg, uint32_t client_id,
 }
 
 int connect_to_backend(const char *host, int port) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
-    return -1;
+  struct addrinfo hints, *res, *p;
+  char port_str[16];
+  int fd = -1;
 
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  inet_pton(AF_INET, host, &addr.sin_addr);
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
 
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
+  snprintf(port_str, sizeof(port_str), "%d", port);
+
+  if (getaddrinfo(host, port_str, &hints, &res) != 0) {
     return -1;
   }
+
+  for (p = res; p != NULL; p = p->ai_next) {
+    if ((fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0) {
+      continue;
+    }
+
+    if (connect(fd, p->ai_addr, p->ai_addrlen) == -1) {
+      close(fd);
+      fd = -1;
+      continue;
+    }
+    break;
+  }
+
+  freeaddrinfo(res);
+
+  if (fd < 0) return -1;
 
   set_nonblocking(fd);
   set_tcp_nodelay(fd);
